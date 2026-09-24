@@ -11,9 +11,11 @@ from .core import (
     IsosurfaceMesh,
     MeshStats,
     ScalarField3D,
+    ScalarFieldBlock,
     Vertex,
     canonical_edge_key,
     extract_isosurface,
+    extract_isosurface_blocks,
     perturbed_below,
 )
 
@@ -28,8 +30,10 @@ __all__ = [
     "IsosurfaceMesh",
     "MeshStats",
     "ScalarField3D",
+    "ScalarFieldBlock",
     "Vertex",
     "canonical_edge_key",
     "extract_isosurface",
+    "extract_isosurface_blocks",
     "perturbed_below",
 ]

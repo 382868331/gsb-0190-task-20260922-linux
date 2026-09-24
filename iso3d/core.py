@@ -22,9 +22,11 @@ __all__ = [
     "IsosurfaceMesh",
     "MeshStats",
     "ScalarField3D",
+    "ScalarFieldBlock",
     "Vertex",
     "canonical_edge_key",
     "extract_isosurface",
+    "extract_isosurface_blocks",
     "perturbed_below",
 ]
 
@@ -197,6 +199,52 @@ class ScalarField3D:
 
 
 @dataclass(frozen=True)
+class ScalarFieldBlock:
+    """位于全局规则晶格中某个轴对齐位置的标量场体块。
+
+    field 的节点 (i, j, k)（局部索引）对应全局晶格节点
+    ``(origin[0] + i, origin[1] + j, origin[2] + k)``。所有体块必须使用
+    相同的单位晶格间距（即只给整数 origin，不支持缩放）。
+
+    相邻体块允许在边界上共享节点：同分辨率体块对齐拼接时，接缝节点会被
+    多块重复给出。合并按全局节点槽位 ``origin + 局部索引`` 进行（整数
+    映射，不做任何浮点距离匹配）；每个全局槽位有唯一所有者，重复给出的
+    值必须精确相等。
+    """
+
+    origin: Tuple[int, int, int]
+    field: "ScalarField3D"
+
+    def __post_init__(self) -> None:
+        origin = self.origin
+        if not isinstance(origin, tuple) or len(origin) != 3:
+            raise InvalidInputError(
+                "origin", f"must be a (oi, oj, ok) tuple of ints, got {type(origin).__name__}"
+            )
+        for axis, coord in zip(("oi", "oj", "ok"), origin):
+            if isinstance(coord, bool) or not isinstance(coord, int):
+                raise InvalidInputError(
+                    "origin", f"{axis} must be an int, got {type(coord).__name__}"
+                )
+            if coord < 0:
+                raise InvalidInputError("origin", f"{axis} must be >= 0, got {coord}")
+        if not isinstance(self.field, ScalarField3D):
+            raise InvalidInputError(
+                "field", f"must be a ScalarField3D, got {type(self.field).__name__}"
+            )
+
+    def global_coords(self) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        """每轴的全局 ``[起点, 终点]`` 节点索引区间（终点含端点）。"""
+        oi, oj, ok = self.origin
+        f = self.field
+        return (
+            (oi, oi + f.ni - 1),
+            (oj, oj + f.nj - 1),
+            (ok, ok + f.nk - 1),
+        )
+
+
+@dataclass(frozen=True)
 class Vertex:
     """等值面顶点：一条全局网格边上的线性插值交点。"""
 
@@ -332,35 +380,15 @@ def _oriented_loop(pts, loop, ref_point):
 # 核心算法
 # ---------------------------------------------------------------------------
 
-def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
-    """从标量场提取 iso 等值面（marching tetrahedra）。
+def _run_extraction(
+    ni: int, nj: int, nk: int, values: Sequence[float], iso_f: float
+) -> IsosurfaceMesh:
+    """在给定全局规则晶格上执行 marching tetrahedra。
 
-    参数
-    ----
-    field : ScalarField3D
-        规则晶格标量场，每维 1..16 个节点，总数 <= 4096。
-    iso : int 或 float
-        等值。必须为有限实数；bool 被拒绝。
-
-    返回
-    ----
-    IsosurfaceMesh
-        顶点（按全局网格边键共享）、定向三角形与统计信息。
-        合法但处处不穿越 iso 的场返回空网格（不抛异常）。
-
-    抛出
-    ----
-    InvalidInputError
-        任何输入违反契约时；此时不产生任何部分结果。
+    values 为行优先扁平序列（节点 (i,j,k) 的全局 ID 为
+    ``(k*nj + j)*ni + i``）。调用方负责完成全部输入校验，本函数不再
+    抛出 InvalidInputError。
     """
-    if not isinstance(field, ScalarField3D):
-        raise InvalidInputError(
-            "field", f"must be a ScalarField3D, got {type(field).__name__}"
-        )
-    iso_f = _finite_float("iso", iso)
-
-    ni, nj, nk = field.ni, field.nj, field.nk
-    values = field.values
 
     def nid(i: int, j: int, k: int) -> int:
         return (k * nj + j) * ni + i
@@ -538,3 +566,192 @@ def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
         nonmanifold_edges=nonmanifold_edges,
         edge_use_count=dict(edge_use),
     )
+
+
+def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
+    """从单个标量场提取 iso 等值面（marching tetrahedra）。
+
+    参数
+    ----
+    field : ScalarField3D
+        规则晶格标量场，每维 1..16 个节点，总数 <= 4096。
+    iso : int 或 float
+        等值。必须为有限实数；bool 被拒绝。
+
+    返回
+    ----
+    IsosurfaceMesh
+        顶点（按全局网格边键共享）、定向三角形与统计信息。
+        合法但处处不穿越 iso 的场返回空网格（不抛异常）。
+
+    抛出
+    ----
+    InvalidInputError
+        任何输入违反契约时；此时不产生任何部分结果。
+    """
+    if not isinstance(field, ScalarField3D):
+        raise InvalidInputError(
+            "field", f"must be a ScalarField3D, got {type(field).__name__}"
+        )
+    iso_f = _finite_float("iso", iso)
+    return _run_extraction(field.ni, field.nj, field.nk, field.values, iso_f)
+
+
+# ---------------------------------------------------------------------------
+# 同分辨率相邻体块拼接
+# ---------------------------------------------------------------------------
+
+def _check_block_sequence(blocks: object) -> int:
+    if isinstance(blocks, (str, bytes)) or not isinstance(blocks, Sequence):
+        raise InvalidInputError(
+            "blocks", f"must be a sequence of ScalarFieldBlock, got {type(blocks).__name__}"
+        )
+    n = len(blocks)
+    if n == 0:
+        raise InvalidInputError("blocks", "must contain at least one block")
+    return n
+
+
+def _merge_blocks(
+    blocks: Sequence[ScalarFieldBlock],
+) -> Tuple[int, int, int, Tuple[float, ...]]:
+    """把相邻体块合并为一张全局规则晶格标量场。
+
+    合并只依据整数槽位映射 ``全局节点 = origin + 局部索引``：
+    每个全局节点槽位有唯一所有者（第一个覆盖它的体块）；接缝节点被多个
+    体块重复给出时，其标量值必须精确相等，否则拒绝。全程不使用坐标距离
+    猜测重复点。
+
+    全局节点总数同样受 MAX_NODES 约束。返回 (ni, nj, nk, values)。
+    """
+    # 先确定全局包围盒。
+    xlo = ylo = zlo = 0
+    xhi = yhi = zhi = -1
+    for bi, block in enumerate(blocks):
+        (ax, bx), (ay, by), (az, bz) = block.global_coords()
+        if bi == 0:
+            xlo, xhi = ax, bx
+            ylo, yhi = ay, by
+            zlo, zhi = az, bz
+        else:
+            xlo = min(xlo, ax)
+            ylo = min(ylo, ay)
+            zlo = min(zlo, az)
+            xhi = max(xhi, bx)
+            yhi = max(yhi, by)
+            zhi = max(zhi, bz)
+    # 构造时 origin >= 0；并集包围盒下界必须为 (0,0,0)：这样合并网格的
+    # 节点坐标与行优先全局节点 ID 与“整块提取”完全一致（包括 iso 恰等
+    # 节点值时按全局 ID 奇偶的符号扰动），拼接结果才能与整块逐面一致。
+    if (xlo, ylo, zlo) != (0, 0, 0):
+        raise InvalidInputError(
+            "blocks",
+            f"block union must be anchored at the lattice origin (0, 0, 0); "
+            f"got lower corner ({xlo}, {ylo}, {zlo}) — subtract the minimum "
+            f"origin from all blocks",
+        )
+    ni = xhi - xlo + 1
+    nj = yhi - ylo + 1
+    nk = zhi - zlo + 1
+    total = ni * nj * nk
+    if total > MAX_NODES:
+        raise InvalidInputError(
+            "blocks",
+            f"merged grid {ni}x{nj}x{nk} = {total} nodes exceeds {MAX_NODES}",
+        )
+
+    # owner[(k*nj + j)*ni + i] = 首个覆盖该槽位的体块号；
+    # 值为 -1 表示尚未被任何体块覆盖。
+    owner: List[int] = [-1] * total
+
+    def slot(gi: int, gj: int, gk: int) -> int:
+        return (gk * nj + gj) * ni + gi
+
+    merged: List[float] = [0.0] * total
+    for bi, block in enumerate(blocks):
+        oi, oj, ok = block.origin
+        f = block.field
+        for dk in range(f.nk):
+            gk = ok + dk
+            for dj in range(f.nj):
+                gj = oj + dj
+                row_base = (dk * f.nj + dj) * f.ni
+                for di in range(f.ni):
+                    gi = oi + di
+                    s = slot(gi, gj, gk)
+                    value = f.values[row_base + di]
+                    prev = owner[s]
+                    if prev < 0:
+                        owner[s] = bi
+                        merged[s] = value
+                    elif merged[s] != value:
+                        raise InvalidInputError(
+                            "blocks",
+                            f"conflicting values at shared node ({gi}, {gj}, {gk}): "
+                            f"block {prev} gives {merged[s]!r}, block {bi} gives {value!r}",
+                        )
+                    # 值精确相等：唯一所有者保持不变，重复槽位被接受。
+
+    uncovered = owner.count(-1) if total else 0
+    if uncovered:
+        # 找到第一个空洞用于定位。
+        s = owner.index(-1)
+        gi = s % ni
+        gj = (s // ni) % nj
+        gk = s // (ni * nj)
+        raise InvalidInputError(
+            "blocks",
+            f"blocks do not form a contiguous filled grid: node "
+            f"({gi}, {gj}, {gk}) is not covered by any block",
+        )
+    return ni, nj, nk, tuple(merged)
+
+
+def extract_isosurface_blocks(
+    blocks: Sequence[ScalarFieldBlock], iso: float
+) -> IsosurfaceMesh:
+    """从若干同分辨率、按整数晶格对齐的相邻体块提取合并等值面。
+
+    参数
+    ----
+    blocks : Sequence[ScalarFieldBlock]
+        至少一个体块。每块用 ``origin`` 指定其在全局晶格中的节点原点，
+        体块间可在边界面/边/线上共享节点（共享采样点）。
+    iso : int 或 float
+        等值，对所有体块相同。必须为有限实数；bool 被拒绝。
+
+    合并规则
+    --------
+    - 全局节点槽位由 ``origin + 局部索引`` 的整数映射唯一确定，**不使用
+      任何浮点距离匹配**；
+    - 每个槽位有唯一所有者（第一个覆盖它的体块）；接缝节点被多块重复
+      给出时，其标量值必须精确相等，否则抛出 InvalidInputError 并定位到
+      全局坐标与冲突的两块；
+    - 体块必须恰好铺满一个连续的轴对齐节点盒（无空洞、不错位），合并后
+      网格节点总数不超过 MAX_NODES。
+
+    返回
+    ----
+    IsosurfaceMesh
+        与把所有体块拼成整块后调用 :func:`extract_isosurface` 的结果逐
+        顶点、逐面（含顶点/面 ID）一致；接缝处不产生重复顶点或裂缝。
+
+    抛出
+    ----
+    InvalidInputError
+        任何输入违反契约时。校验在任何合并计算生效前完成，失败时不返回
+        任何部分结果（本接口无持久状态，调用方传入的对象不被修改）。
+    """
+    n = _check_block_sequence(blocks)
+    iso_f = _finite_float("iso", iso)
+    # 逐块校验类型（ScalarFieldBlock.__post_init__ 已校验 origin 与 field），
+    # 先完成全部校验再做合并，保证失败路径不产生部分结果。
+    for bi in range(n):
+        block = blocks[bi]
+        if not isinstance(block, ScalarFieldBlock):
+            raise InvalidInputError(
+                f"blocks[{bi}]",
+                f"must be a ScalarFieldBlock, got {type(block).__name__}",
+            )
+    ni, nj, nk, values = _merge_blocks(blocks)
+    return _run_extraction(ni, nj, nk, values, iso_f)

@@ -2,7 +2,9 @@
 
 离线三维重建工程中的可复用模块：在规则体素晶格上用 marching tetrahedra
 提取标量场等值面，所有交点按**全局网格边键**共享，输出定向三角形网格与
-边界统计。纯 Python 标准库实现，无任何第三方依赖。
+边界统计。支持把**同分辨率的相邻体块**拼成一张大网格：共享采样点采用
+唯一所有者，顶点 ID 由全局网格边确定，拼接结果与整块提取逐面一致。
+纯 Python 标准库实现，无任何第三方依赖。
 
 ## 环境
 
@@ -30,6 +32,29 @@ mesh = extract_isosurface(field, iso=16.0)
 print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
 ```
 
+同分辨率相邻体块拼接（接缝面上的节点由两块重复给出，合并后只保留一个）：
+
+```python
+from iso3d import ScalarField3D, ScalarFieldBlock, extract_isosurface_blocks
+
+n, cuts = 9, (0, 4, 8)  # 每轴切成 [0..4] / [4..8]，接缝共享坐标 4 的节点面
+func = lambda i, j, k: (i - 4.0) ** 2 + (j - 4.0) ** 2 + (k - 4.0) ** 2
+blocks = []
+for x in range(2):
+    for y in range(2):
+        for z in range(2):
+            ox, oy, oz = cuts[x], cuts[y], cuts[z]
+            block_values = tuple(
+                float(func(ox + i, oy + j, oz + k))
+                for k in range(5) for j in range(5) for i in range(5)
+            )
+            blocks.append(ScalarFieldBlock(
+                origin=(ox, oy, oz),
+                field=ScalarField3D(ni=5, nj=5, nk=5, values=block_values),
+            ))
+mesh = extract_isosurface_blocks(blocks, iso=7.0)
+```
+
 ## 接口
 
 ### 输入
@@ -43,6 +68,32 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   - `ScalarField3D.from_nested(nested)`：由 `nested[k][j][i]` 嵌套序列构造。
 - `extract_isosurface(field, iso) -> IsosurfaceMesh`：提取等值面。
   `iso` 为有限实数。
+
+### 相邻体块拼接输入
+
+- `ScalarFieldBlock(origin, field)`：位于全局晶格中某个轴对齐位置的体块。
+  - `origin: (oi, oj, ok)`：非负整数原点。体块局部节点 `(i, j, k)` 对应
+    全局晶格节点 `(oi+i, oj+j, ok+k)`；所有体块使用相同的单位晶格间距
+    （坐标即整数索引，不支持缩放/旋转）。
+  - `field`：该体块的 `ScalarField3D`（仍受单块维度与节点数上限约束）。
+- `extract_isosurface_blocks(blocks, iso) -> IsosurfaceMesh`：
+  合并若干相邻体块并提取等值面。`blocks` 为非空的 `ScalarFieldBlock`
+  序列，`iso` 对所有体块相同。
+  - **唯一所有者**：全局节点槽位由 `origin + 局部索引` 的整数映射唯一
+    确定，第一个覆盖该槽位的体块为所有者；**全程不使用浮点距离猜测重复
+    点**。接缝节点被多块重复给出时，其标量值必须**精确相等**（`==`），
+    否则拒绝并在错误消息中定位全局坐标与冲突的两块，例如
+    `blocks: conflicting values at shared node (1, 1, 0): block 0 gives
+    0.0, block 1 gives 9.0`。
+  - **铺满要求**：体块并集必须恰好铺满一个连续的轴对齐节点盒，无空洞、
+    无错位；并集下界必须为 `(0, 0, 0)`（数据有偏移时由调用方先减去
+    最小原点）。合并后总节点数不超过 `MAX_NODES`（4096）。
+  - **逐面一致**：合并网格的节点坐标与行优先全局节点 ID 与“把所有体块
+    拼成整块后调用 `extract_isosurface`”完全一致，因此两个入口的结果
+    逐顶点、逐面（含顶点/面 ID、`t`、面积、统计、退化面记录）相等；
+    iso 恰等于接缝节点值时，符号扰动也按该全局 ID 奇偶统一判定。
+  - 允许体块顺序任意、允许同一体块重复给出（所有者取第一个，值一致即可），
+    不允许仅“相互接触”但接缝面值不一致的输入。
 
 ### 输出（`IsosurfaceMesh`，冻结数据类）
 
@@ -111,11 +162,18 @@ TETRA_TABLE = (
 - `ni/nj/nk`：拒绝 bool、非 int、`< 1`、`> 16`；
 - `values`：拒绝非序列、长度不符、NaN、±Infinity、bool、非数值；
 - `iso`：拒绝 bool、非数值、NaN、±Infinity；
-- `field`：拒绝非 `ScalarField3D` 对象。
+- `field`：拒绝非 `ScalarField3D` 对象；
+- 体块拼接 `extract_isosurface_blocks` 还拒绝：
+  - `blocks` 非序列或为空、元素不是 `ScalarFieldBlock`（定位到
+    `blocks[i]`）；
+  - `origin` 不是 3 个非负整数（拒绝 bool）、`field` 类型不对；
+  - 接缝节点值冲突（定位全局坐标与冲突的两块）；
+  - 体块间存在空洞（给出第一个未覆盖节点坐标）、并集下界不是
+    `(0, 0, 0)`、合并后节点数超过 `MAX_NODES`。
 
 输入校验在任何计算之前完成，失败时不产生任何部分结果；本模块为纯函数
-式接口，无可变全局状态。空结果（无穿越）是合法的“已证明无等值面”，
-与错误路径严格区分。
+式接口，无可变全局状态，传入的冻结数据类不会被修改。空结果（无穿越）
+是合法的“已证明无等值面”，与错误路径严格区分。
 
 ## 误差口径
 
@@ -146,7 +204,10 @@ TETRA_TABLE = (
 
 - 仅支持规则等距晶格，坐标即整数索引（无 origin/spacing 变换；
   需要物理坐标时由调用方自行缩放）。
-- 输入上限为每维 16 节点、总数 4096（本题接口边界），不是性能上限。
+- 体块拼接仅支持同间距、整数原点对齐的轴对齐体块，且并集须铺满从
+  `(0,0,0)` 起的连续节点盒；不支持多分辨率/自适应细化、不支持体块间
+  间隙或旋转；接缝节点重复值按精确 `==` 判定，不做近似合并。
+- 输入上限为每维 16 节点、合并后总数 4096（本题接口边界），不是性能上限。
 - 退化面被丢弃后，其邻边会在统计中表现为边界边；这是如实报告而非
   网格修复。本模块不做网格简化、法向估计或孔洞填补。
 - 等值面恰与晶格平面重合时，扰动决定薄片归属，结果确定但可能与
@@ -162,8 +223,9 @@ tests/
   _reference.py        # 独立参考实现（不 import iso3d）
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
+  test_blocks.py       # 相邻体块拼接：面/边/角接缝、手算例子、冲突与空洞失败路径
   test_validation.py   # 输入校验与错误语义
-demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+demo.py                # 固定输入演示（正常结果 + 体块拼接 + 拒绝边界）
 README.md
 ```
 
