@@ -10,10 +10,12 @@ from .core import (
     InvalidInputError,
     IsosurfaceMesh,
     MeshStats,
+    ScalarBlock3D,
     ScalarField3D,
     Vertex,
     canonical_edge_key,
     extract_isosurface,
+    extract_isosurface_blocks,
     perturbed_below,
 )
 
@@ -27,9 +29,11 @@ __all__ = [
     "InvalidInputError",
     "IsosurfaceMesh",
     "MeshStats",
+    "ScalarBlock3D",
     "ScalarField3D",
     "Vertex",
     "canonical_edge_key",
     "extract_isosurface",
+    "extract_isosurface_blocks",
     "perturbed_below",
 ]
