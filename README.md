@@ -1,19 +1,22 @@
-# iso3d — 体素等值面的共享边交点提取（marching tetrahedra）
+# iso3d — 体素等值面的共享边交点提取与溯源（marching tetrahedra）
 
 离线三维重建工程中的可复用模块：在规则体素晶格上用 marching tetrahedra
 提取标量场等值面，所有交点按**全局网格边键**共享，输出定向三角形网格与
-边界统计。纯 Python 标准库实现，无任何第三方依赖。
+边界统计。每个共享交点附**来源网格边、线性插值权重**及对标量端值与 iso
+的**解析敏感度**（不可微情形明确标记，不输出伪精确大数）。
+纯 Python 标准库实现，无任何第三方依赖。
 
 ## 环境
 
 - Python 3.14.7（已在该版本验证；仅使用标准库 `dataclasses` / `math` / `typing`）
-- 安装 Python 后无需安装任何其他依赖；核心、测试、演示全部离线运行
+- 固定解释器 `./.venv/bin/python`；安装 Python 后无需安装任何其他依赖；
+  核心、测试、演示全部离线运行
 
 ## 快速开始
 
 ```bash
-python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 运行演示（约 0.1 秒）
+./.venv/bin/python -m unittest discover -s tests -v   # 运行全部测试
+./.venv/bin/python demo.py                            # 运行演示（约 0.1 秒）
 ```
 
 ```python
@@ -28,6 +31,20 @@ values = tuple(
 field = ScalarField3D(ni=n, nj=n, nk=n, values=values)
 mesh = extract_isosurface(field, iso=16.0)
 print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
+
+# 每个共享交点一条溯源记录：来源网格边、插值权重、标量敏感度
+for rec in mesh.intersections:
+    a, b = rec.edge_key
+    wa, wb = rec.weights            # point = wa*P_a + wb*P_b, wa+wb == 1
+    if rec.sensitivity.differentiable:
+        d_va = rec.sensitivity.d_point_d_va   # 交点对节点 a 标量值的偏导
+        d_vb = rec.sensitivity.d_point_d_vb
+        d_iso = rec.sensitivity.d_point_d_iso
+    else:
+        pass  # rec.sensitivity.reason 说明为何不可微，导数字段为 None
+
+# 查询一个输入节点变化会影响哪些交点
+print(mesh.intersections_for_node(field.node_id(8, 7, 7)))
 ```
 
 ## 接口
@@ -58,6 +75,17 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
 - `degenerate_faces`：每条被丢弃零面积面的记录（所在立方体、四面体
   序号、三条边键）。
 - `boundary_edges` / `nonmanifold_edges` / `edge_use_count`：边级明细。
+- `intersections: tuple[IntersectionRecord, ...]`：每个共享交点一条的
+  **溯源记录**，与 `vertices` 一一对应（`intersections[v].vertex_id == v`）。
+  - `IntersectionRecord.edge_key`：来源网格边（两端全局节点 ID 升序对）。
+    同一条物理边无论被多少四面体/面引用（含反向遍历、跨立方体共享面的
+    面对角线与体对角线），来源记录都**全局唯一**，绝不按面重复生成。
+  - `IntersectionRecord.weights = (w_a, w_b)`：对两端节点的线性插值权重，
+    `w_a + w_b == 1`，`point = w_a*P_a + w_b*P_b`。
+  - `IntersectionRecord.sensitivity`：交点位置对 `v_a`、`v_b`、`iso` 三个
+    标量输入的解析偏导（`ScalarSensitivity`，见“标量敏感度”一节）。
+  - `intersection_for_vertex(vertex_id)` / `intersections_for_node(node_id)`：
+    按顶点 ID 取记录，或列出一个输入节点作为来源端点影响的全部交点。
 - 合法但处处不穿越 `iso` 的场返回**空网格**（已证明无等值面），不抛异常。
 
 ### 公开常量与辅助
@@ -66,6 +94,9 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
 - `CUBE_CORNERS`：立方体 8 角点局部偏移，角点编号按 `i + 2j + 4k`。
 - `canonical_edge_key(id_a, id_b)`：规范边键（升序对）。
 - `perturbed_below(value, iso, node_id)`：拓扑判定规则（见下）。
+- `IntersectionRecord` / `ScalarSensitivity`：交点溯源记录与敏感度结构。
+- `NONDIFF_ZERO_DENOMINATOR` / `NONDIFF_ENDPOINT_ON_ISO` /
+  `NONDIFF_UNSTABLE_DENOMINATOR`：三种不可微原因代码。
 
 ## 四面体分解表
 
@@ -103,6 +134,45 @@ TETRA_TABLE = (
 - **定向**：每个三角形生成后用该四面体的一个“上方”节点校验法向，
   保证法向指向标量增大一侧。
 
+## 标量敏感度（交点可追溯到哪些原标量节点）
+
+设来源边端点为 A=`edge_key[0]`、B=`edge_key[1]`，坐标 P_A、P_B，
+标量值 v_a、v_b。交点为
+
+```
+t     = (iso - v_a) / (v_b - v_a)
+P     = P_A + t (P_B - P_A) = w_a P_A + w_b P_B,  w_a = 1-t, w_b = t
+```
+
+对三个独立标量输入的**解析导数**为
+
+```
+dt/dv_a = (iso - v_b) / (v_b - v_a)^2
+dt/dv_b = (v_a - iso) / (v_b - v_a)^2
+dt/diso = 1 / (v_b - v_a)
+dP/d(*) = (P_B - P_A) · dt/d(*)
+```
+
+`ScalarSensitivity` 字段：`d_point_d_va`、`d_point_d_vb`、`d_point_d_iso`
+（各为 3 分量坐标偏导），以及 `differentiable` 与 `reason`。
+
+- **可微**：边严格跨过 iso（`(v_a-iso)` 与 `(v_b-iso)` 异号、分母非零）
+  且 `|v_b-v_a| >= 2^-24` 时给出解析导数。
+- **不可微**（三个导数字段均为 `None`，不输出巨大的伪精确数）：
+  - `"zero_denominator"`：`v_b == v_a`（两端值相等且恰为 iso，几何取中点，
+    对输入无导数）；
+  - `"endpoint_on_iso"`：`v_a == iso` 或 `v_b == iso`，交点恰在端点上，
+    是符号扰动的拓扑分支点；
+  - `"unstable_denominator"`：`0 < |v_b-v_a| < 2^-24`，标量差极小，
+    解析公式数值不稳定。**几何交点照常给出**，只是不宣称导数。
+- **适用范围**：敏感度只描述交点沿**同一条**网格边的滑动，仅对
+  **当前拓扑不变的小扰动**有效；扰动使端点越过 iso 会产生/消失交点、
+  改变面连接关系，此时导数不能跨拓扑延拓。本模块不对此作任何承诺。
+
+`tests/test_sensitivity.py` 在线性斜坡体上手算交点，对安全边用**双侧
+有限差分**（实际以 ±h 重新提取）独立核对全部三个导数，并专测反向遍历
+共享边、标量差极小与端点恰 iso 三种情形。
+
 ## 错误语义
 
 所有非法输入抛出 `iso3d.InvalidInputError`（`ValueError` 子类），消息
@@ -127,6 +197,9 @@ TETRA_TABLE = (
   面积，且对本实现恒不大于同分辨率的理论极限。测试仅做宽松合理性
   检查（球面积比在 0.75–1.0 之间），**精确口径以平面解析测试为准**。
 - 退化判定使用精确零面积准则，不以宽容差掩盖边界情况。
+- 敏感度为线性插值的**解析导数**，本身只有一次乘除的浮点舍入；
+  `tests/test_sensitivity.py` 用 h=1e-6 双侧有限差分核对，三个导数的
+  最大分量误差约 1e-10（差分截断误差 O(h²) 量级），阈值 1e-7。
 
 ## 设计取舍
 
@@ -151,19 +224,23 @@ TETRA_TABLE = (
   网格修复。本模块不做网格简化、法向估计或孔洞填补。
 - 等值面恰与晶格平面重合时，扰动决定薄片归属，结果确定但可能与
   “直觉的一侧”不同；几何位置始终精确。
+- 标量敏感度仅在当前拓扑不变的小扰动下成立，不承诺跨拓扑（交点
+  产生/消失）有效；分母为零、端点恰 iso 或标量差小于 2^-24 时明确
+  标记不可微而非给出不可信数值。
 
 ## 仓库结构
 
 ```
 iso3d/
   __init__.py          # 公开导出
-  core.py              # 核心算法与数据结构
+  core.py              # 核心算法、数据结构与交点溯源/敏感度
 tests/
   _reference.py        # 独立参考实现（不 import iso3d）
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
+  test_sensitivity.py  # 手算交点、三导数双侧差分、反向共享边、极小标量差、端点恰 iso
   test_validation.py   # 输入校验与错误语义
-demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+demo.py                # 固定输入演示（正常结果 + 拒绝边界 + 溯源/敏感度）
 README.md
 ```
 
