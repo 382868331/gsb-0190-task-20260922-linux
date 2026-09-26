@@ -23,9 +23,15 @@ __all__ = [
     "MeshStats",
     "ScalarField3D",
     "Vertex",
+    "BandFace",
+    "BandMesh",
+    "BandStats",
+    "BandVertex",
     "canonical_edge_key",
+    "extract_band",
     "extract_isosurface",
     "perturbed_below",
+    "signed_volume",
 ]
 
 # ---------------------------------------------------------------------------
@@ -326,6 +332,435 @@ def _oriented_loop(pts, loop, ref_point):
     if _dot(normal, _sub(ref_point, p0)) < 0.0:
         return [loop[0], loop[2], loop[1]]
     return loop
+
+
+# ---------------------------------------------------------------------------
+
+BAND_BELOW = -1
+"""数值带分类：f < low。"""
+BAND_INSIDE = 0
+"""数值带分类：low <= f <= high（恰等于阈值统一归带内）。"""
+BAND_ABOVE = 1
+"""数值带分类：f > high。"""
+
+
+@dataclass(frozen=True)
+class BandVertex:
+    """数值带边界顶点。
+
+    kind 为 ``"edge"`` 时是网格边上的阈值交点（level 给出所属阈值，
+    0=low、1=high，low/high 即使几何重合也保持不同身份）；
+    kind 为 ``"node"`` 时是恰在带内的网格节点（盖片用）。
+    """
+
+    id: int
+    point: Tuple[float, float, float]
+    kind: str
+    edge_key: Tuple[int, int] | None
+    level: int | None
+    t: float
+
+
+@dataclass(frozen=True)
+class BandFace:
+    """数值带边界三角形。
+
+    surface 为 ``"low"``（低阈值墙）、``"high"``（高阈值墙）或
+    ``"cap"``（网格外边界盖片）。统一按朝外（数值带外侧）定向。
+    """
+
+    id: int
+    vertex_ids: Tuple[int, int, int]
+    area: float
+    surface: str
+
+
+@dataclass(frozen=True)
+class BandStats:
+    """数值带提取结果统计。"""
+
+    low: float
+    high: float
+    thickness_zero: bool
+    node_count: int
+    cell_count: int
+    tetrahedron_count: int
+    vertex_count: int
+    face_count: int
+    low_wall_face_count: int
+    high_wall_face_count: int
+    cap_face_count: int
+    degenerate_face_count: int
+    boundary_edge_count: int
+    nonmanifold_edge_count: int
+    total_area: float
+    signed_volume: float
+
+
+@dataclass(frozen=True)
+class BandMesh:
+    """``extract_band`` 的定向三角网结果（法向统一朝数值带外侧）。"""
+
+    low: float
+    high: float
+    thickness_zero: bool
+    """low == high 时为 True：结果是零厚度等值面，不构成有体积实体。"""
+    vertices: Tuple[BandVertex, ...]
+    faces: Tuple[BandFace, ...]
+    stats: BandStats
+    degenerate_faces: Tuple[DegenerateFace, ...]
+    boundary_edges: Tuple[Tuple[int, int], ...]
+    nonmanifold_edges: Tuple[Tuple[int, int], ...]
+    edge_use_count: Dict[Tuple[int, int], int] = field(compare=False)
+
+    def total_area(self) -> float:
+        return self.stats.total_area
+
+    def signed_volume(self) -> float:
+        """有向三角网的散度体积积分（与 stats.signed_volume 一致）。"""
+        return self.stats.signed_volume
+
+
+def signed_volume(vertices, faces) -> float:
+    """对定向三角网计算闭合体积积分 (1/6) * sum a.(b x c)。
+
+    vertices 为带 ``point`` 属性的序列；faces 的每项取 ``vertex_ids``。
+    法向朝外时结果为正。开曲面得到的值没有体积意义。
+    """
+    total = 0.0
+    for face in faces:
+        va, vb, vc = (vertices[v].point for v in face.vertex_ids)
+        total += _dot(va, _cross(vb, vc))
+    return total / 6.0
+
+
+def _band_caps(nid, ncoord, values, ni, nj, nk, low_f, high_f,
+               vertices, vertex_by_key, get_edge_vertex, get_node_vertex,
+               emit, emit_fan, degenerate):
+    """在数值带与网格外边界相交处补盖片。
+
+    对四面体化后落在网格 6 个外平面上的三角形（每条恰由一个四面体
+    贡献，故全局不重不漏），裁剪到带内部分 low<=f<=high，再以朝外
+    法向三角化。交点身份按 (网格边键, 阈值) 解析，与阈值墙共享；
+    恰等于阈值的节点统一归属带内，相邻单元不会重复盖面。
+    """
+    def in_band(v: float) -> bool:
+        return low_f <= v <= high_f
+
+    seen_tri = set()
+
+    def clip_boundary_tri(tri_nodes, cell, tet_index, outward):
+        tri_key = tuple(sorted(tri_nodes))
+        if tri_key in seen_tri:
+            return
+        seen_tri.add(tri_key)
+        # 沿原三角形周长按参数累积事件点：带内节点与阈值交点。
+        # 一条边可能同时穿过 low、high（中间整段在带外/带内），
+        # 因此按边上插值参数 t 排序收集。
+        ordered = []
+        for ea in range(3):
+            eb = (ea + 1) % 3
+            na, nb = tri_nodes[ea], tri_nodes[eb]
+            va, vb = values[na], values[nb]
+            events = []
+            if in_band(va):
+                events.append((0.0, get_node_vertex(na)))
+            for level, tag in ((low_f, 0), (high_f, 1)):
+                lo, hi = (va, vb) if va < vb else (vb, va)
+                if lo < level < hi:
+                    key = canonical_edge_key(na, nb)
+                    events.append(
+                        ((level - va) / (vb - va),
+                         get_edge_vertex(key, level, tag))
+                    )
+            events.sort(key=lambda item: item[0])
+            for _, vid in events:
+                if not ordered or ordered[-1] != vid:
+                    ordered.append(vid)
+        poly = []
+        for vid in ordered:
+            if not poly or poly[-1] != vid:
+                poly.append(vid)
+        if len(poly) > 1 and poly[0] == poly[-1]:
+            poly.pop()
+        if len(poly) < 3:
+            if len(poly) >= 1:
+                degenerate.append(DegenerateFace(
+                    cell=cell, tet_index=tet_index,
+                    edge_keys=tuple(vertices[v].edge_key for v in poly),
+                ))
+            return
+        pts = [vertices[v].point for v in poly]
+        emit_fan(poly, pts, outward, cell, tet_index, "cap")
+
+    # 四面体面（4 选 3）；判断三个角点是否都落在某个网格外平面上。
+    from itertools import combinations as _comb
+    tet_faces_local = tuple(_comb(range(4), 3))
+
+    for k in range(nk - 1):
+        for j in range(nj - 1):
+            for i in range(ni - 1):
+                cell = (i, j, k)
+                corner_ids = tuple(
+                    nid(i + di, j + dj, k + dk) for (di, dj, dk) in CUBE_CORNERS
+                )
+                planes = []
+                if i == 0: planes.append((0, 0, -1.0))
+                if i == ni - 2: planes.append((0, 1, 1.0))
+                if j == 0: planes.append((1, 0, -1.0))
+                if j == nj - 2: planes.append((1, 1, 1.0))
+                if k == 0: planes.append((2, 0, -1.0))
+                if k == nk - 2: planes.append((2, 1, 1.0))
+                if not planes:
+                    continue
+                for tet_index, tet in enumerate(TETRA_TABLE):
+                    for lf in tet_faces_local:
+                        glob = tuple(corner_ids[tet[li]] for li in lf)
+                        for axis, fixed_i, sign in planes:
+                            if all(CUBE_CORNERS[tet[li]][axis] == fixed_i for li in lf):
+                                outward = tuple(sign if d == axis else 0.0 for d in range(3))
+                                clip_boundary_tri(glob, cell, tet_index, outward)
+
+
+def extract_band(field: ScalarField3D, low, high) -> BandMesh:
+    """提取 ``low <= f <= high`` 数值带的封闭定向边界。
+
+    边界由三部分组成：低阈值 ``low`` 等值面墙、高阈值 ``high``
+    等值面墙，以及数值带与网格外边界相交处的盖片。所有三角形统一
+    按**法向朝向数值带外侧**定向。
+
+    标量恰等于阈值的节点统一归属带内（``low<=f``、``f<=high``），
+    全局一致，避免相邻单元重复盖面。
+
+    ``low == high`` 时为零厚度特殊结果：只输出 ``f == low`` 等值面
+    （标记 ``thickness_zero``），不补盖片、不宣称有向体积。
+
+    抛出 ``InvalidInputError``：field 类型错、low/high 非有限实数、
+    bool、或 ``low > high``。
+    """
+    if not isinstance(field, ScalarField3D):
+        raise InvalidInputError(
+            "field", f"must be a ScalarField3D, got {type(field).__name__}"
+        )
+    low_f = _finite_float("low", low)
+    high_f = _finite_float("high", high)
+    if low_f > high_f:
+        raise InvalidInputError(
+            "low", f"must be <= high, got low={low_f} > high={high_f}"
+        )
+    return _band_extract(field, low_f, high_f, low_f == high_f)
+
+
+def _band_extract(
+    field: ScalarField3D,
+    low_f: float,
+    high_f: float,
+    zero_thickness: bool,
+):
+    ni, nj, nk = field.ni, field.nj, field.nk
+    values = field.values
+
+    def nid(i: int, j: int, k: int) -> int:
+        return (k * nj + j) * ni + i
+
+    def ncoord(node_id: int) -> Tuple[float, float, float]:
+        i = node_id % ni
+        j = (node_id // ni) % nj
+        k = node_id // (ni * nj)
+        return (float(i), float(j), float(k))
+
+    vertices: List[BandVertex] = []
+    vertex_by_key: Dict[tuple, int] = {}
+
+    def get_edge_vertex(key: Tuple[int, int], level_value: float, level_tag: int) -> int:
+        vkey = ("e", key, level_tag)
+        vid = vertex_by_key.get(vkey)
+        if vid is not None:
+            return vid
+        id_a, id_b = key
+        va, vb = values[id_a], values[id_b]
+        denom = vb - va
+        t = 0.5 if denom == 0.0 else (level_value - va) / denom
+        pa, pb = ncoord(id_a), ncoord(id_b)
+        point = (
+            pa[0] + t * (pb[0] - pa[0]),
+            pa[1] + t * (pb[1] - pa[1]),
+            pa[2] + t * (pb[2] - pa[2]),
+        )
+        if t == 0.0:
+            return get_node_vertex(id_a)
+        if t == 1.0:
+            return get_node_vertex(id_b)
+        vid = len(vertices)
+        vertices.append(BandVertex(id=vid, point=point, kind="edge",
+                                   edge_key=key, level=level_tag, t=t))
+        vertex_by_key[vkey] = vid
+        return vid
+
+    def get_node_vertex(node: int) -> int:
+        vkey = ("n", node)
+        vid = vertex_by_key.get(vkey)
+        if vid is not None:
+            return vid
+        p = ncoord(node)
+        vid = len(vertices)
+        vertices.append(BandVertex(id=vid, point=p, kind="node",
+                                   edge_key=None, level=None, t=0.0))
+        vertex_by_key[vkey] = vid
+        return vid
+
+    faces: List[BandFace] = []
+    degenerate: List[DegenerateFace] = []
+    edge_use: Dict[Tuple[int, int], int] = {}
+
+    def emit(vids, cell, tet_index, surface):
+        p0 = vertices[vids[0]].point
+        p1 = vertices[vids[1]].point
+        p2 = vertices[vids[2]].point
+        area = _tri_area(p0, p1, p2)
+        if area == 0.0:
+            degenerate.append(DegenerateFace(
+                cell=cell, tet_index=tet_index,
+                edge_keys=tuple(vertices[v].edge_key for v in vids),
+            ))
+            return
+        faces.append(BandFace(id=len(faces), vertex_ids=tuple(vids),
+                              area=area, surface=surface))
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            x, y = vids[a], vids[b]
+            ek = (x, y) if x < y else (y, x)
+            edge_use[ek] = edge_use.get(ek, 0) + 1
+
+    def emit_fan(poly_vids, pts, outward, cell, tet_index, surface):
+        if len(poly_vids) < 3:
+            return
+        normal = _cross(_sub(pts[1], pts[0]), _sub(pts[2], pts[0]))
+        rev = _dot(normal, outward) < 0.0
+        m = len(poly_vids)
+        for idx in range(1, m - 1):
+            tri = (poly_vids[0], poly_vids[idx], poly_vids[idx + 1])
+            if rev:
+                tri = (tri[0], tri[2], tri[1])
+            emit(tri, cell, tet_index, surface)
+
+    # -- 阈值墙：对每个阈值做一次标准 marching tetrahedra ----------------
+    # level_tag 0 = low（二分类：f < low 在带外，f >= low 在带内）
+    # level_tag 1 = high（二分类：f <= high 在带内，f > high 在带外）
+    # 墙的法向指向“带外”参考点：low 取下方节点，high 取上方节点。
+    wall_specs = [(low_f, 0, "low")]
+    if not zero_thickness:
+        wall_specs.append((high_f, 1, "high"))
+
+    for level_value, tag, surface_name in wall_specs:
+        def inside_band(v: float) -> bool:
+            return v >= level_value if tag == 0 else v <= level_value
+
+        for k in range(nk - 1):
+            for j in range(nj - 1):
+                for i in range(ni - 1):
+                    corner_ids = tuple(
+                        nid(i + di, j + dj, k + dk) for (di, dj, dk) in CUBE_CORNERS
+                    )
+                    inside = tuple(inside_band(values[c]) for c in corner_ids)
+                    cell = (i, j, k)
+                    for tet_index, tet in enumerate(TETRA_TABLE):
+                        tet_nodes = tuple(corner_ids[c] for c in tet)
+                        tin = tuple(inside[c] for c in tet)
+                        ni_in = sum(tin)
+                        if ni_in == 0 or ni_in == 4:
+                            continue
+                        crossings = []
+                        for ea, eb in _TET_EDGES:
+                            if tin[ea] != tin[eb]:
+                                crossings.append(
+                                    canonical_edge_key(tet_nodes[ea], tet_nodes[eb])
+                                )
+                        if len(crossings) == 3:
+                            vids = tuple(get_edge_vertex(key, level_value, tag)
+                                         for key in crossings)
+                            pts = [vertices[v].point for v in vids]
+                            # 带外参考节点：low 墙取 f<low 的节点，high 墙取 f>high。
+                            ref_local = next(idx for idx in range(4) if not tin[idx])
+                            order = _oriented_loop(
+                                pts, [0, 1, 2], ncoord(tet_nodes[ref_local])
+                            )
+                            emit((vids[order[0]], vids[order[1]], vids[order[2]]),
+                                 cell, tet_index, surface_name)
+                        else:
+                            entries = [
+                                (get_edge_vertex(key, level_value, tag), key)
+                                for key in crossings
+                            ]
+                            pts = [vertices[v].point for v, _ in entries]
+                            centroid = tuple(
+                                sum(p[d] for p in pts) / 4.0 for d in range(3)
+                            )
+                            out_local = [idx for idx in range(4)
+                                         if (not tin[idx] if tag == 0 else not tin[idx])]
+                            in_local = [idx for idx in range(4) if tin[idx]]
+                            out_mid = tuple(
+                                sum(ncoord(tet_nodes[idx])[d] for idx in out_local)
+                                / len(out_local) for d in range(3)
+                            )
+                            in_mid = tuple(
+                                sum(ncoord(tet_nodes[idx])[d] for idx in in_local)
+                                / len(in_local) for d in range(3)
+                            )
+                            ref = _sub(out_mid, in_mid)
+                            if _norm(ref) == 0.0:
+                                ref = (1.0, 0.0, 0.0)
+                            axis = min(range(3), key=lambda d: (abs(ref[d]), d))
+                            basis = [0.0, 0.0, 0.0]
+                            basis[axis] = 1.0
+                            u = _cross(ref, tuple(basis))
+                            u = tuple(c / _norm(u) for c in u)
+                            w = _cross(ref, u)
+
+                            def angle(idx: int) -> float:
+                                rel = _sub(pts[idx], centroid)
+                                return math.atan2(_dot(rel, w), _dot(rel, u))
+
+                            order = sorted(
+                                range(4), key=lambda idx: (angle(idx), entries[idx][1])
+                            )
+                            loop = _oriented_loop(pts, list(order), out_mid)
+                            emit((entries[loop[0]][0], entries[loop[1]][0],
+                                  entries[loop[2]][0]), cell, tet_index, surface_name)
+                            emit((entries[loop[0]][0], entries[loop[2]][0],
+                                  entries[loop[3]][0]), cell, tet_index, surface_name)
+
+    if not zero_thickness:
+        _band_caps(nid, ncoord, values, ni, nj, nk, low_f, high_f,
+                   vertices, vertex_by_key, get_edge_vertex, get_node_vertex,
+                   emit, emit_fan, degenerate)
+
+    boundary_edges = tuple(sorted(k for k, c in edge_use.items() if c == 1))
+    nonmanifold_edges = tuple(sorted(k for k, c in edge_use.items() if c >= 3))
+    total_area = sum(f.area for f in faces)
+    vol = 0.0 if zero_thickness else signed_volume(vertices, faces)
+    node_count = ni * nj * nk
+    cell_count = (ni - 1) * (nj - 1) * (nk - 1)
+    stats = BandStats(
+        low=low_f, high=high_f, thickness_zero=zero_thickness,
+        node_count=node_count, cell_count=cell_count,
+        tetrahedron_count=cell_count * len(TETRA_TABLE),
+        vertex_count=len(vertices), face_count=len(faces),
+        low_wall_face_count=sum(1 for f in faces if f.surface == "low"),
+        high_wall_face_count=sum(1 for f in faces if f.surface == "high"),
+        cap_face_count=sum(1 for f in faces if f.surface == "cap"),
+        degenerate_face_count=len(degenerate),
+        boundary_edge_count=len(boundary_edges),
+        nonmanifold_edge_count=len(nonmanifold_edges),
+        total_area=total_area, signed_volume=vol,
+    )
+    return BandMesh(
+        low=low_f, high=high_f, thickness_zero=zero_thickness,
+        vertices=tuple(vertices), faces=tuple(faces), stats=stats,
+        degenerate_faces=tuple(degenerate),
+        boundary_edges=boundary_edges,
+        nonmanifold_edges=nonmanifold_edges,
+        edge_use_count=dict(edge_use),
+    )
 
 
 # ---------------------------------------------------------------------------

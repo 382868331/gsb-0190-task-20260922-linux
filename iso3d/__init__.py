@@ -12,9 +12,15 @@ from .core import (
     MeshStats,
     ScalarField3D,
     Vertex,
+    BandFace,
+    BandMesh,
+    BandStats,
+    BandVertex,
     canonical_edge_key,
+    extract_band,
     extract_isosurface,
     perturbed_below,
+    signed_volume,
 )
 
 __all__ = [
@@ -29,7 +35,13 @@ __all__ = [
     "MeshStats",
     "ScalarField3D",
     "Vertex",
+    "BandFace",
+    "BandMesh",
+    "BandStats",
+    "BandVertex",
     "canonical_edge_key",
+    "extract_band",
     "extract_isosurface",
     "perturbed_below",
+    "signed_volume",
 ]

@@ -9,11 +9,27 @@
 - Python 3.14.7（已在该版本验证；仅使用标准库 `dataclasses` / `math` / `typing`）
 - 安装 Python 后无需安装任何其他依赖；核心、测试、演示全部离线运行
 
+### 隔离 venv 准备（可选，推荐）
+
+仓库不依赖任何第三方包；如需与系统环境隔离：
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip   # 仅为隔离环境本身；不安装任何项目依赖
+python --version                       # 应为 Python 3.14.7
+deactivate                             # 离开隔离环境
+```
+
+`requirements.txt` 只含一行注释说明“标准库即可”，`pip install -r` 不会
+安装任何包。不使用 Docker、外部服务、账号或密钥。
+
 ## 快速开始
 
 ```bash
 python -m unittest discover -s tests -v   # 运行全部测试
 python demo.py                            # 运行演示（约 0.1 秒）
+python demo_iteration.py                  # 数值带增量演示（约 0.1 秒，远低于 90 秒）
 ```
 
 ```python
@@ -43,6 +59,8 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   - `ScalarField3D.from_nested(nested)`：由 `nested[k][j][i]` 嵌套序列构造。
 - `extract_isosurface(field, iso) -> IsosurfaceMesh`：提取等值面。
   `iso` 为有限实数。
+- `extract_band(field, low, high) -> BandMesh`：提取 `low <= f <= high`
+  数值带的封闭定向边界（见下节）。
 
 ### 输出（`IsosurfaceMesh`，冻结数据类）
 
@@ -59,6 +77,36 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   序号、三条边键）。
 - `boundary_edges` / `nonmanifold_edges` / `edge_use_count`：边级明细。
 - 合法但处处不穿越 `iso` 的场返回**空网格**（已证明无等值面），不抛异常。
+
+### 数值带输出（`BandMesh`，冻结数据类）
+
+`extract_band(field, low, high)` 提取数值带 `low <= f <= high` 的完整
+边界，统一按**法向朝向数值带外侧**定向，由三类三角形组成：
+
+- `surface="low"`：低阈值等值面墙（`f == low`，法向朝 `f < low` 一侧）；
+- `surface="high"`：高阈值等值面墙（`f == high`，法向朝 `f > high` 一侧）；
+- `surface="cap"`：数值带与**网格外边界**相交处补上的盖片（沿外平面
+  裁剪四面体面得到，法向指向网格外侧）。
+
+`BandMesh` 字段：
+
+- `vertices: tuple[BandVertex, ...]`：`kind="edge"` 为阈值交点（带
+  `edge_key` 与 `level`，0=low、1=high）；`kind="node"` 为恰在带内的
+  网格节点（盖片使用）。交点按“网格边键 + 所属阈值”共享身份，**low、
+  high 两面即使在零厚度时几何重合也绝不错误合并**。
+- `faces: tuple[BandFace, ...]`：每个面带 `vertex_ids`、`area`、`surface`。
+- `thickness_zero`：`low == high` 时为 `True`，结果是零厚度等值面
+  （仅 low 墙，不补盖片、`signed_volume == 0`），**不伪装成有体积实体**；
+  开口曲面的 `boundary_edge_count` 如实非零。
+- `stats: BandStats`：计数（含 `low/high/cap_wall_face_count`、
+  边界/非流形边数、总面积）与 `signed_volume`（散度体积积分
+  `(1/6)·Σ a·(b×c)`，闭合朝外时为正）。
+- `boundary_edges` / `nonmanifold_edges` / `edge_use_count`：边级明细。
+- 全空带（无任何节点/交点落在带内）返回**空网格**；全包含时两墙为空、
+  盖片恰好覆盖盒子 6 个外表面。
+
+`signed_volume(vertices, faces)` 同时作为公开辅助导出，可对任意带
+`point` 顶点与 `vertex_ids` 面的定向三角网计算体积积分。
 
 ### 公开常量与辅助
 
@@ -90,6 +138,22 @@ TETRA_TABLE = (
 
 ## 关键规则
 
+### 数值带规则（extract_band）
+
+- **阈值归属统一**：标量恰等于阈值的节点**统一归属带内**
+  （`f >= low` 与 `f <= high`，不使用等值面提取里的奇偶扰动）。
+  该规则对整个网格全局一致，墙与盖片共用同一交点身份，相邻单元不会
+  对同一节点重复盖面。
+- **共享交点身份**：盖片边上的阈值交点通过 `(规范网格边键, 阈值层级)`
+  解析到与阈值墙完全相同的顶点；交点恰落在节点上（插值参数为 0 或 1）
+  时统一归一为该节点顶点（`kind="node"`），保证墙-盖片缝合处水密。
+- **盖片生成**：仅四面体化后落在网格 6 个外平面上的三角形参与，每条
+  这样的面恰由一个四面体贡献（全局不重不漏）；对每个三角形收集周长上的
+  “带内节点 + 严格内部阈值交点”，按边上插值参数排序即得裁剪多边形，
+  再扇形三角化并按网格外法向定向。盖片与墙的交线天然与墙共享顶点。
+- **零厚度**：`low == high` 是特殊结果而非退化实体：只输出一层等值面、
+  标记 `thickness_zero`、体积记 0；曲面在网格内被截断时边界边如实非零。
+
 - **共享边键**：交点挂在四面体边上，边键为两端点**全局节点 ID 的升序对**。
   四面体边包括立方体棱、面内对角线与体对角线 0-7；对角线交点位于立方体
   面内/体内，同样按节点 ID 对共享（相邻立方体在同一条对角线上必然得到
@@ -111,6 +175,9 @@ TETRA_TABLE = (
 - `ni/nj/nk`：拒绝 bool、非 int、`< 1`、`> 16`；
 - `values`：拒绝非序列、长度不符、NaN、±Infinity、bool、非数值；
 - `iso`：拒绝 bool、非数值、NaN、±Infinity；
+- `low` / `high`（`extract_band`）：各拒绝 bool、非数值、NaN、±Infinity；
+  并拒绝 `low > high`（错误定位在参数 `low`）。`low == high` 合法，
+  表示零厚度。
 - `field`：拒绝非 `ScalarField3D` 对象。
 
 输入校验在任何计算之前完成，失败时不产生任何部分结果；本模块为纯函数
@@ -127,6 +194,13 @@ TETRA_TABLE = (
   面积，且对本实现恒不大于同分辨率的理论极限。测试仅做宽松合理性
   检查（球面积比在 0.75–1.0 之间），**精确口径以平面解析测试为准**。
 - 退化判定使用精确零面积准则，不以宽容差掩盖边界情况。
+
+数值带的体积口径：对线性场 `f=x+y+z` 切 `[0,L]^3` 盒子，带区体积由
+独立的分段三次分布函数给出（`tests/test_band.py::cdf_diag`），与
+有向三角网散度积分比较，相对容差 1e-9（仅浮点累加舍入）；
+`demo_iteration.py` 现场计算同一核对，并审计每条非退化边恰被两个方向
+相反的面邻接。对非线性场，两堵阈值墙是分片线性逼近，盖片在外平面上
+由线性插值精确生成；体积随网格加密收敛。
 
 ## 设计取舍
 
@@ -146,6 +220,8 @@ TETRA_TABLE = (
 
 - 仅支持规则等距晶格，坐标即整数索引（无 origin/spacing 变换；
   需要物理坐标时由调用方自行缩放）。
+- 数值带提取同样仅适用于上述规则晶格：提供两堵阈值等值面墙与外边界
+  盖片及有向体积/流形审计；不做非结构网格、布尔运算或网格修复。
 - 输入上限为每维 16 节点、总数 4096（本题接口边界），不是性能上限。
 - 退化面被丢弃后，其邻边会在统计中表现为边界边；这是如实报告而非
   网格修复。本模块不做网格简化、法向估计或孔洞填补。
@@ -163,7 +239,9 @@ tests/
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
   test_validation.py   # 输入校验与错误语义
+  test_band.py         # extract_band：独立体积、双向邻接、触边/全包含/全空/零厚度/阈值归属
 demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+demo_iteration.py      # 数值带真实计算演示（体积积分核对 + 流形审计 + 四类情形）
 README.md
 ```
 
