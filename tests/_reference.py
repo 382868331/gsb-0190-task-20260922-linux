@@ -154,3 +154,118 @@ def plane_box_intersection_area(a, b, c, iso, xmax, ymax, zmax):
 
     pts.sort(key=angle)
     return _polygon_area_3d(pts)
+
+
+def band_box_volume(a, b, c, low, high, xmax, ymax, zmax):
+    """区域 {low <= a*x+b*y+c*z <= high} 与盒子 [0,xmax]x[0,ymax]x[0,zmax] 的交集体积。
+
+    独立参考：把盒子表示为 6 个四边形面，依次用两个半空间做凸多面体
+    裁剪（Sutherland-Hodgman），裁剪产生的新截面由交点绕质心角排序
+    得到；最后对每个面按外法向定向并用散度定理求体积。
+    仅用于截面不恰好经过盒子顶点的测试场景。
+    """
+    faces = [
+        [(0, 0, 0), (0, ymax, 0), (0, ymax, zmax), (0, 0, zmax)],
+        [(xmax, 0, 0), (xmax, 0, zmax), (xmax, ymax, zmax), (xmax, ymax, 0)],
+        [(0, 0, 0), (0, 0, zmax), (xmax, 0, zmax), (xmax, 0, 0)],
+        [(0, ymax, 0), (xmax, ymax, 0), (xmax, ymax, zmax), (0, ymax, zmax)],
+        [(0, 0, 0), (xmax, 0, 0), (xmax, ymax, 0), (0, ymax, 0)],
+        [(0, 0, zmax), (0, ymax, zmax), (xmax, ymax, zmax), (xmax, 0, zmax)],
+    ]
+    faces = [[tuple(float(coord) for coord in p) for p in poly] for poly in faces]
+
+    def clip_all(level, keep_ge):
+        nonlocal faces
+        new_faces = []
+        cap_pts = []
+        for poly in faces:
+            n = len(poly)
+            out = []
+            for idx in range(n):
+                cur = poly[idx]
+                nxt = poly[(idx + 1) % n]
+                fc = a * cur[0] + b * cur[1] + c * cur[2]
+                fn = a * nxt[0] + b * nxt[1] + c * nxt[2]
+                cur_in = fc >= level if keep_ge else fc <= level
+                nxt_in = fn >= level if keep_ge else fn <= level
+                if cur_in:
+                    out.append(cur)
+                if cur_in != nxt_in:
+                    t = (level - fc) / (fn - fc)
+                    pt = tuple(cur[d] + t * (nxt[d] - cur[d]) for d in range(3))
+                    cap_pts.append(pt)
+                    out.append(pt)
+            if len(out) >= 3:
+                new_faces.append(out)
+        # 裁剪截面：交点去重后绕质心按平面内角度排序。
+        uniq = []
+        for p in cap_pts:
+            if not any(
+                abs(p[0] - q[0]) < 1e-12
+                and abs(p[1] - q[1]) < 1e-12
+                and abs(p[2] - q[2]) < 1e-12
+                for q in uniq
+            ):
+                uniq.append(p)
+        if len(uniq) >= 3:
+            cx = sum(p[0] for p in uniq) / len(uniq)
+            cy = sum(p[1] for p in uniq) / len(uniq)
+            cz = sum(p[2] for p in uniq) / len(uniq)
+            norm = math.sqrt(a * a + b * b + c * c)
+            nrm = (a / norm, b / norm, c / norm)
+            ref = (1.0, 0.0, 0.0) if abs(nrm[0]) < 0.9 else (0.0, 1.0, 0.0)
+            u = (
+                nrm[1] * ref[2] - nrm[2] * ref[1],
+                nrm[2] * ref[0] - nrm[0] * ref[2],
+                nrm[0] * ref[1] - nrm[1] * ref[0],
+            )
+            un = math.sqrt(sum(v * v for v in u))
+            u = (u[0] / un, u[1] / un, u[2] / un)
+            w = (
+                nrm[1] * u[2] - nrm[2] * u[1],
+                nrm[2] * u[0] - nrm[0] * u[2],
+                nrm[0] * u[1] - nrm[1] * u[0],
+            )
+
+            def ang(p):
+                rel = (p[0] - cx, p[1] - cy, p[2] - cz)
+                return math.atan2(
+                    rel[0] * w[0] + rel[1] * w[1] + rel[2] * w[2],
+                    rel[0] * u[0] + rel[1] * u[1] + rel[2] * u[2],
+                )
+
+            uniq.sort(key=ang)
+            new_faces.append(uniq)
+        faces = new_faces
+
+    clip_all(low, True)
+    clip_all(high, False)
+
+    # 多面体质心（用于外法向定向；凸多面体顶点质心必在内部）。
+    all_pts = [p for poly in faces for p in poly]
+    cx = sum(p[0] for p in all_pts) / len(all_pts)
+    cy = sum(p[1] for p in all_pts) / len(all_pts)
+    cz = sum(p[2] for p in all_pts) / len(all_pts)
+    volume = 0.0
+    for poly in faces:
+        p0, p1, p2 = poly[0], poly[1], poly[2]
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        nrm = (
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        )
+        outward = (
+            nrm[0] * (p0[0] - cx) + nrm[1] * (p0[1] - cy) + nrm[2] * (p0[2] - cz)
+        ) > 0.0
+        ordered = poly if outward else list(reversed(poly))
+        o0 = ordered[0]
+        for idx in range(1, len(ordered) - 1):
+            q0, q1, q2 = o0, ordered[idx], ordered[idx + 1]
+            volume += (
+                q0[0] * (q1[1] * q2[2] - q1[2] * q2[1])
+                + q0[1] * (q1[2] * q2[0] - q1[0] * q2[2])
+                + q0[2] * (q1[0] * q2[1] - q1[1] * q2[0])
+            ) / 6.0
+    return volume

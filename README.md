@@ -2,18 +2,31 @@
 
 离线三维重建工程中的可复用模块：在规则体素晶格上用 marching tetrahedra
 提取标量场等值面，所有交点按**全局网格边键**共享，输出定向三角形网格与
-边界统计。纯 Python 标准库实现，无任何第三方依赖。
+边界统计；并提供**数值带提取**（`extract_band`）：截取 low ≤ f ≤ high 的
+区域边界，除两层等值面外自动补上区域与网格外边界相交处的盖片，法向统一
+朝向数值带外侧。纯 Python 标准库实现，无任何第三方依赖。
 
 ## 环境
 
 - Python 3.14.7（已在该版本验证；仅使用标准库 `dataclasses` / `math` / `typing`）
 - 安装 Python 后无需安装任何其他依赖；核心、测试、演示全部离线运行
 
+## 隔离 venv 准备（可选但推荐）
+
+模块本身零依赖，venv 仅用于隔离解释器环境：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Linux
+python -m unittest discover -s tests -v
+```
+
 ## 快速开始
 
 ```bash
 python -m unittest discover -s tests -v   # 运行全部测试
 python demo.py                            # 运行演示（约 0.1 秒）
+python demo_iteration.py                  # 数值带提取演示（约 0.1 秒，真实离线计算）
 ```
 
 ```python
@@ -43,6 +56,9 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   - `ScalarField3D.from_nested(nested)`：由 `nested[k][j][i]` 嵌套序列构造。
 - `extract_isosurface(field, iso) -> IsosurfaceMesh`：提取等值面。
   `iso` 为有限实数。
+- `extract_band(field, low, high) -> BandMesh`：提取数值带
+  low ≤ f ≤ high 的区域边界。`low`、`high` 为有限实数且 low ≤ high；
+  `low == high` 是零厚度特殊结果（见下）。
 
 ### 输出（`IsosurfaceMesh`，冻结数据类）
 
@@ -59,6 +75,25 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   序号、三条边键）。
 - `boundary_edges` / `nonmanifold_edges` / `edge_use_count`：边级明细。
 - 合法但处处不穿越 `iso` 的场返回**空网格**（已证明无等值面），不抛异常。
+
+### 数值带输出（`BandMesh`，冻结数据类）
+
+- `low` / `high` / `zero_thickness`：数值带参数与零厚度标记。
+- `vertices` / `faces`：与 `IsosurfaceMesh` 同构；顶点按
+  **(全局网格边键, 等值层)** 共享——同一条网格边同时穿越 low 与 high 时
+  注册为两个不同顶点（不同插值参数 t），低面与高面不会错误合并。
+  盖片区域完整包含某个网格节点时，该节点注册为
+  `edge_key=(nid, nid), t=0.0` 的顶点。
+- `faces` 法向统一朝向**数值带外侧**：高面（f == high）指向标量增大
+  方向，低面（f == low）指向标量减小方向，盖片指向网格外侧。
+- `stats: BandStats`：在 `MeshStats` 同类计数之外增加
+  `cap_face_count`（外边界盖片三角形数）与 `signed_volume`
+  （有向三角网体积积分 Σ dot(p0, cross(p1, p2)) / 6；封闭网格即数值带
+  区域体积）。`degenerate_faces` 中 `tet_index == -1` 的记录来自盖片。
+- **零厚度**（low == high）：只返回该值的单层等值面（与
+  `extract_isosurface` 一致），不生成盖片，`zero_thickness=True`，
+  `signed_volume` 恒为 0.0——它是零厚度曲面，不伪装成有体积实体。
+- 数值带处处为空（如 low 高于场最大值）返回**空网格**，不抛异常。
 
 ### 公开常量与辅助
 
@@ -102,6 +137,20 @@ TETRA_TABLE = (
   组合上相邻的边变成边界边，这如实反映在 `boundary_edge_count` 中。
 - **定向**：每个三角形生成后用该四面体的一个“上方”节点校验法向，
   保证法向指向标量增大一侧。
+- **组合式定向**：法向定向用四面体穿越边的**中点**（半整数坐标，精确）
+  而非交点本身计算。节点值距阈值仅 1 ulp 时会产生 ~1e-16 的薄片三角形，
+  直接用交点几何定向在数值上失稳；中点保持组合结构，对任意非退化
+  四面体定向都是确定的。
+- **盖片**（仅 `extract_band`）：网格 6 个外边界面按四面体分解诱导的
+  面内对角线剖分为边界三角形，逐个用半空间 f ≥ low、f ≤ high 做
+  凸多边形裁剪（Sutherland-Hodgman），扇形剖分后发射。每个边界三角形
+  只属于一个立方体，且裁剪用真实标量值、f == low / f == high 的顶点
+  统一判为带内（归属一致），相邻单元不会重复生成盖片；裁剪保持环绕
+  方向，盖片法向即网格外法向。盖片在网格边上的截点与内部等值面按
+  (边键, 等值层) 共享顶点身份；节点值恰等于阈值时 3D 侧的 t=0/t=1
+  层顶点与盖片节点顶点几何重合，按精确坐标合并身份。等值面恰与四面体
+  面重合时产生的几何完全相同的面（扰动薄片）按无向顶点三元组归并：
+  反向面成对抵消，同向面只保留一个。
 
 ## 错误语义
 
@@ -111,6 +160,8 @@ TETRA_TABLE = (
 - `ni/nj/nk`：拒绝 bool、非 int、`< 1`、`> 16`；
 - `values`：拒绝非序列、长度不符、NaN、±Infinity、bool、非数值；
 - `iso`：拒绝 bool、非数值、NaN、±Infinity；
+- `low` / `high`：拒绝 bool、非数值、NaN、±Infinity，以及 low > high
+  （错误定位在 `high`）；
 - `field`：拒绝非 `ScalarField3D` 对象。
 
 输入校验在任何计算之前完成，失败时不产生任何部分结果；本模块为纯函数
@@ -127,6 +178,11 @@ TETRA_TABLE = (
   面积，且对本实现恒不大于同分辨率的理论极限。测试仅做宽松合理性
   检查（球面积比在 0.75–1.0 之间），**精确口径以平面解析测试为准**。
 - 退化判定使用精确零面积准则，不以宽容差掩盖边界情况。
+- 对**线性标量场**，`extract_band` 的 `signed_volume` 是数值带区域的
+  精确体积：测试中 8³/16³ 网格的斜向线性场与独立凸多面体裁剪参考
+  （`tests/_reference.py`）比较，相对容差 1e-9；`demo_iteration.py`
+  另用独立的 z 向切片积分交叉核对。封闭性以拓扑不变量验证：每条非退化
+  边恰被两个面以相反方向邻接。
 
 ## 设计取舍
 
@@ -151,19 +207,26 @@ TETRA_TABLE = (
   网格修复。本模块不做网格简化、法向估计或孔洞填补。
 - 等值面恰与晶格平面重合时，扰动决定薄片归属，结果确定但可能与
   “直觉的一侧”不同；几何位置始终精确。
+- 某一维只有 1 个节点时网格没有任何立方体，`extract_band` 返回空网格。
+- 节点值与阈值相差 1 ulp 量级时，盖片/等值面可能出现 ~1e-16 尺度的
+  薄片三角形：定向由组合规则保证一致，但这类薄片的几何面积本身
+  不可信（这是输入舍入的如实反映，不做静默清理）。
 
 ## 仓库结构
 
 ```
 iso3d/
   __init__.py          # 公开导出
-  core.py              # 核心算法与数据结构
+  core.py              # 核心算法与数据结构（等值面 + 数值带）
 tests/
   _reference.py        # 独立参考实现（不 import iso3d）
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
   test_validation.py   # 输入校验与错误语义
+  test_band.py         # 数值带：线性场体积、边对向邻接、触边/全包含/全空、
+                       #   零厚度、精确阈值归属、输入校验
 demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+demo_iteration.py      # 数值带演示（体积交叉核对 + 四类形态 + 拒绝边界）
 README.md
 ```
 
