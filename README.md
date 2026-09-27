@@ -43,6 +43,36 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   - `ScalarField3D.from_nested(nested)`：由 `nested[k][j][i]` 嵌套序列构造。
 - `extract_isosurface(field, iso) -> IsosurfaceMesh`：提取等值面。
   `iso` 为有限实数。
+- `update_isosurface(old_field, old_mesh, new_field, changed_nodes=None, iso=None)`
+  ：体数据局部修改后的**增量更新**（见下节）。
+
+## 增量更新
+
+体数据只改了一小片时，不必重新生成整个表面：
+
+```python
+new_field = ScalarField3D(ni=n, nj=n, nk=n, values=new_values)
+updated = update_isosurface(field, mesh, new_field, changed_nodes=[idx0, idx1])
+```
+
+- 只对**包含变化节点的立方体**重新执行 marching tetrahedra，未受影响
+  区域的 `Vertex` / `Face` 对象及其 ID **原样保留**，上层可继续引用。
+- `changed_nodes` 为变化节点的扁平索引序列；传 `None` 时自动逐节点
+  比较新旧场求差。给出的集合可以是实际变化的超集（多算但结果一致）。
+- 共享边上的交点按全局边键去重：变化节点相邻的所有立方体都在受影响
+  集合内，边缘交点被两侧一致重建，**不会在修改区域边缘留下裂缝**。
+- 值恰好跨过 iso 时，新增/消失的三角形由受影响立方体的局部重提取
+  自然处理（拓扑判定规则与全量提取完全相同）。
+- 返回网格的**几何与对 new_field 完整重提取完全一致**（顶点坐标、
+  三角形、退化记录、各项统计）；仅顶点/面 ID 的编号不同——更新后
+  ID 可能不再连续（保留旧 ID，新元素从旧最大 ID 之后继续编号）。
+  注意 `boundary_edges` / `nonmanifold_edges` / `edge_use_count` 按
+  顶点 ID 键控，与全量重提取比较时需先映射到几何坐标。
+- `iso` 默认沿用 `old_mesh.iso`；显式给出不同的等值时所有交点几何
+  都会变化，身份无法保留，此时退化为对 `new_field` 的完整重提取。
+- 失败语义：所有校验（维度一致、`changed_nodes` 为合法节点 ID、
+  `iso` 有限等）在计算之前完成，函数为纯函数、不修改任何输入；
+  更新失败抛出 `InvalidInputError` 时，**旧结果仍可继续使用**。
 
 ### 输出（`IsosurfaceMesh`，冻结数据类）
 
@@ -151,19 +181,25 @@ TETRA_TABLE = (
   网格修复。本模块不做网格简化、法向估计或孔洞填补。
 - 等值面恰与晶格平面重合时，扰动决定薄片归属，结果确定但可能与
   “直觉的一侧”不同；几何位置始终精确。
+- 增量更新后顶点/面 ID 不再保证连续（未受影响部分保留原 ID）；
+  `edge_use_count` 等边级输出按顶点 ID 键控，跨网格比较时应映射到
+  几何坐标。若调用方传入的 `old_mesh` 与 `old_field` 不一致
+  （非本库对旧场的提取结果），更新会抛出 `InvalidInputError` 而不是
+  产生静默错误的结果。
 
 ## 仓库结构
 
 ```
 iso3d/
   __init__.py          # 公开导出
-  core.py              # 核心算法与数据结构
+  core.py              # 核心算法与数据结构（含增量更新）
 tests/
   _reference.py        # 独立参考实现（不 import iso3d）
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
   test_validation.py   # 输入校验与错误语义
-demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+  test_update.py       # 增量更新：几何一致性、身份保留、失败语义
+demo.py                # 固定输入演示（正常结果 + 拒绝边界 + 增量更新）
 README.md
 ```
 

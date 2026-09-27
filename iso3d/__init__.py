@@ -15,6 +15,7 @@ from .core import (
     canonical_edge_key,
     extract_isosurface,
     perturbed_below,
+    update_isosurface,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "canonical_edge_key",
     "extract_isosurface",
     "perturbed_below",
+    "update_isosurface",
 ]

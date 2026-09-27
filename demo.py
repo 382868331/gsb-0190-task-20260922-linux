@@ -4,12 +4,19 @@
 内容：
   1. 正常结果：16^3 球谐场（解析球）等值面提取，输出面积与非流形边计数等统计；
   2. 拒绝边界：标量场含 NaN，演示可定位的 InvalidInputError。
+  3. 增量更新：只改一小片体数据后局部更新等值面，未受影响部分身份保留，
+     几何与完整重提取一致。
 """
 
 import math
 import time
 
-from iso3d import InvalidInputError, ScalarField3D, extract_isosurface
+from iso3d import (
+    InvalidInputError,
+    ScalarField3D,
+    extract_isosurface,
+    update_isosurface,
+)
 
 
 def sphere_field(n=16, radius=4.0):
@@ -66,10 +73,65 @@ def demo_rejection():
     print()
 
 
+def demo_incremental_update():
+    print("=== 增量更新：只改 2x2x2 一片体数据，局部更新等值面 ===")
+    field, iso, _ = sphere_field()
+    old_mesh = extract_isosurface(field, iso)
+
+    n = field.ni
+    changed = []
+    new_values = list(field.values)
+    for k in (7, 8):
+        for j in (7, 8):
+            for i in (11, 12):
+                idx = (k * n + j) * n + i
+                changed.append(idx)
+                new_values[idx] = 30.0  # 把球面边界附近一小片推到等值面外侧
+    new_field = ScalarField3D(ni=n, nj=n, nk=n, values=tuple(new_values))
+
+    t0 = time.perf_counter()
+    updated = update_isosurface(field, old_mesh, new_field, changed_nodes=changed)
+    update_elapsed = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    reference = extract_isosurface(new_field, iso)
+    full_elapsed = time.perf_counter() - t0
+
+    # 与 ID 无关的几何指纹：顶点坐标 + 三角形坐标多重集。
+    def fingerprint(mesh):
+        by_id = {v.id: v for v in mesh.vertices}
+        return (
+            sorted(v.point for v in mesh.vertices),
+            sorted(
+                tuple(sorted(by_id[vid].point for vid in f.vertex_ids))
+                for f in mesh.faces
+            ),
+        )
+
+    same_geometry = fingerprint(updated) == fingerprint(reference)
+    old_vertex_ids = {v.id for v in old_mesh.vertices}
+    old_face_ids = {f.id for f in old_mesh.faces}
+    kept_vertices = sum(1 for v in updated.vertices if v.id in old_vertex_ids)
+    kept_faces = sum(1 for f in updated.faces if f.id in old_face_ids)
+    print(f"修改节点数       : {len(changed)} / {field.ni ** 3}")
+    print(
+        f"更新后顶点/三角形: {updated.stats.vertex_count} / {updated.stats.face_count}"
+    )
+    print(f"保留旧顶点/旧面  : {kept_vertices} / {kept_faces}  (身份未变，可继续引用)")
+    print(
+        f"增量更新耗时     : {update_elapsed * 1000.0:.1f} ms  "
+        f"(完整重提取 {full_elapsed * 1000.0:.1f} ms)"
+    )
+    print(f"与完整重提取几何一致: {'是' if same_geometry else '否'}")
+    ok = same_geometry and kept_faces > 0
+    print(f"增量更新正确性   : {'通过' if ok else '未通过'}")
+    print()
+
+
 def main():
     t0 = time.perf_counter()
     demo_sphere()
     demo_rejection()
+    demo_incremental_update()
     print(f"demo 总耗时: {time.perf_counter() - t0:.2f} s")
 
 
