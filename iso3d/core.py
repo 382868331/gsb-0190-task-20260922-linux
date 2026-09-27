@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence, Tuple
 
@@ -19,6 +20,7 @@ __all__ = [
     "DegenerateFace",
     "Face",
     "InvalidInputError",
+    "IsosurfaceExtractor",
     "IsosurfaceMesh",
     "MeshStats",
     "ScalarField3D",
@@ -328,6 +330,143 @@ def _oriented_loop(pts, loop, ref_point):
     return loop
 
 
+def _node_coord(node_id: int, ni: int, nj: int) -> Tuple[float, float, float]:
+    i = node_id % ni
+    j = (node_id // ni) % nj
+    k = node_id // (ni * nj)
+    return (float(i), float(j), float(k))
+
+
+def _interpolate_edge(
+    values: Sequence[float], iso: float, ni: int, nj: int, key: Tuple[int, int]
+) -> Tuple[Tuple[float, float, float], float]:
+    """全局网格边 key 上的线性插值交点与参数 t（纯函数，确定性）。
+
+    两端值都恰等于 iso 时（分母为 0）取中点 t = 0.5；拓扑已由符号扰动决定。
+    """
+    id_a, id_b = key
+    va = values[id_a]
+    vb = values[id_b]
+    denom = vb - va
+    t = 0.5 if denom == 0.0 else (iso - va) / denom
+    pa = _node_coord(id_a, ni, nj)
+    pb = _node_coord(id_b, ni, nj)
+    point = (
+        pa[0] + t * (pb[0] - pa[0]),
+        pa[1] + t * (pb[1] - pa[1]),
+        pa[2] + t * (pb[2] - pa[2]),
+    )
+    return point, t
+
+
+def _cell_primitives(
+    values: Sequence[float],
+    iso: float,
+    ni: int,
+    nj: int,
+    ci: int,
+    cj: int,
+    ck: int,
+) -> Tuple[Tuple[int, Tuple[Tuple[int, int], ...], Tuple[Tuple[Tuple[int, int], ...], ...], Tuple[Tuple[Tuple[int, int], ...], ...]], ...]:
+    """计算单个立方体穿越 iso 的全部四面体图元（纯函数）。
+
+    返回 tuple，每项对应一个有穿越的四面体：
+    (tet_index, crossings, triangles, degenerates)，其中
+
+    - crossings：按 _TET_EDGES 顺序的穿越边键（全局节点 ID 升序对）；
+    - triangles：定向后的边键三元组（法向指向标量增大侧，非零面积）；
+    - degenerates：几何零面积（精确叉积为零）的边键三元组，应被丢弃并记录。
+    """
+
+    def nid(i: int, j: int, k: int) -> int:
+        return (k * nj + j) * ni + i
+
+    corner_ids = tuple(
+        nid(ci + di, cj + dj, ck + dk) for (di, dj, dk) in CUBE_CORNERS
+    )
+    below = tuple(perturbed_below(values[c], iso, c) for c in corner_ids)
+
+    point_cache: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+
+    def point_of(key: Tuple[int, int]) -> Tuple[float, float, float]:
+        p = point_cache.get(key)
+        if p is None:
+            p, _ = _interpolate_edge(values, iso, ni, nj, key)
+            point_cache[key] = p
+        return p
+
+    results = []
+    for tet_index, tet in enumerate(TETRA_TABLE):
+        tet_nodes = tuple(corner_ids[c] for c in tet)
+        tet_below = tuple(below[c] for c in tet)
+        nb = sum(tet_below)
+        if nb == 0 or nb == 4:
+            continue
+        crossings: List[Tuple[int, int]] = []
+        for ea, eb in _TET_EDGES:
+            if tet_below[ea] != tet_below[eb]:
+                crossings.append(canonical_edge_key(tet_nodes[ea], tet_nodes[eb]))
+        # K4 二染色下穿越边数只可能是 3 或 4。
+        triangles: List[Tuple[Tuple[int, int], ...]] = []
+        degenerates: List[Tuple[Tuple[int, int], ...]] = []
+        if len(crossings) == 3:
+            pts = [point_of(key) for key in crossings]
+            ref_local = 0 if not tet_below[0] else next(
+                idx for idx in range(1, 4) if not tet_below[idx]
+            )
+            ref_point = _node_coord(tet_nodes[ref_local], ni, nj)
+            order = _oriented_loop(pts, [0, 1, 2], ref_point)
+            tri = (crossings[order[0]], crossings[order[1]], crossings[order[2]])
+            if _tri_area(pts[order[0]], pts[order[1]], pts[order[2]]) == 0.0:
+                degenerates.append(tri)
+            else:
+                triangles.append(tri)
+        else:  # 4 条穿越边：一个四边形，切成两个三角形
+            pts = [point_of(key) for key in crossings]
+            centroid = (
+                sum(p[0] for p in pts) / 4.0,
+                sum(p[1] for p in pts) / 4.0,
+                sum(p[2] for p in pts) / 4.0,
+            )
+            above_local = [idx for idx in range(4) if not tet_below[idx]]
+            below_local = [idx for idx in range(4) if tet_below[idx]]
+            above_mid = tuple(
+                sum(_node_coord(tet_nodes[idx], ni, nj)[d] for idx in above_local)
+                / len(above_local)
+                for d in range(3)
+            )
+            below_mid = tuple(
+                sum(_node_coord(tet_nodes[idx], ni, nj)[d] for idx in below_local)
+                / len(below_local)
+                for d in range(3)
+            )
+            ref = _sub(above_mid, below_mid)
+            if _norm(ref) == 0.0:
+                ref = (1.0, 0.0, 0.0)
+            # 构造与 ref 垂直的平面基 (u, w)。
+            axis = min(range(3), key=lambda d: (abs(ref[d]), d))
+            basis = [0.0, 0.0, 0.0]
+            basis[axis] = 1.0
+            u = _cross(ref, tuple(basis))
+            u = tuple(c / _norm(u) for c in u)
+            w = _cross(ref, u)
+
+            def angle(idx: int) -> float:
+                rel = _sub(pts[idx], centroid)
+                return math.atan2(_dot(rel, w), _dot(rel, u))
+
+            order = sorted(range(4), key=lambda idx: (angle(idx), crossings[idx]))
+            loop = _oriented_loop(pts, list(order), above_mid)
+            for tri_idx in ((loop[0], loop[1], loop[2]), (loop[0], loop[2], loop[3])):
+                tri = (crossings[tri_idx[0]], crossings[tri_idx[1]], crossings[tri_idx[2]])
+                if _tri_area(pts[tri_idx[0]], pts[tri_idx[1]], pts[tri_idx[2]]) == 0.0:
+                    degenerates.append(tri)
+                else:
+                    triangles.append(tri)
+        results.append((tet_index, tuple(crossings), tuple(triangles), tuple(degenerates)))
+    return tuple(results)
+
+
 # ---------------------------------------------------------------------------
 # 核心算法
 # ---------------------------------------------------------------------------
@@ -362,15 +501,6 @@ def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
     ni, nj, nk = field.ni, field.nj, field.nk
     values = field.values
 
-    def nid(i: int, j: int, k: int) -> int:
-        return (k * nj + j) * ni + i
-
-    def ncoord(node_id: int) -> Tuple[float, float, float]:
-        i = node_id % ni
-        j = (node_id // ni) % nj
-        k = node_id // (ni * nj)
-        return (float(i), float(j), float(k))
-
     vertices: List[Vertex] = []
     vertex_by_edge: Dict[Tuple[int, int], int] = {}
 
@@ -378,23 +508,7 @@ def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
         vid = vertex_by_edge.get(key)
         if vid is not None:
             return vid
-        id_a, id_b = key
-        va = values[id_a]
-        vb = values[id_b]
-        denom = vb - va
-        if denom == 0.0:
-            # 仅当两端值都恰等于 iso 时发生（否则两端同侧，不会成为穿越边）。
-            # 取中点以保持确定性；拓扑已由符号扰动决定。
-            t = 0.5
-        else:
-            t = (iso_f - va) / denom
-        pa = ncoord(id_a)
-        pb = ncoord(id_b)
-        point = (
-            pa[0] + t * (pb[0] - pa[0]),
-            pa[1] + t * (pb[1] - pa[1]),
-            pa[2] + t * (pb[2] - pa[2]),
-        )
+        point, t = _interpolate_edge(values, iso_f, ni, nj, key)
         vid = len(vertices)
         vertices.append(Vertex(id=vid, point=point, edge_key=key, t=t))
         vertex_by_edge[key] = vid
@@ -404,111 +518,30 @@ def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
     degenerate: List[DegenerateFace] = []
     edge_use: Dict[Tuple[int, int], int] = {}
 
-    def emit_triangle(vids: Tuple[int, int, int], cell, tet_index) -> None:
-        p0, p1, p2 = (vertices[vids[0]].point, vertices[vids[1]].point, vertices[vids[2]].point)
-        area = _tri_area(p0, p1, p2)
-        if area == 0.0:
-            degenerate.append(
-                DegenerateFace(
-                    cell=cell,
-                    tet_index=tet_index,
-                    edge_keys=tuple(vertices[v].edge_key for v in vids),
-                )
-            )
-            return
-        faces.append(Face(id=len(faces), vertex_ids=tuple(vids), area=area))
-        for a, b in ((0, 1), (1, 2), (2, 0)):
-            key = (vids[a], vids[b]) if vids[a] < vids[b] else (vids[b], vids[a])
-            edge_use[key] = edge_use.get(key, 0) + 1
-
     for k in range(nk - 1):
         for j in range(nj - 1):
             for i in range(ni - 1):
-                corner_ids = tuple(
-                    nid(i + di, j + dj, k + dk) for (di, dj, dk) in CUBE_CORNERS
-                )
-                below = tuple(
-                    perturbed_below(values[c], iso_f, c) for c in corner_ids
-                )
                 cell = (i, j, k)
-                for tet_index, tet in enumerate(TETRA_TABLE):
-                    tet_nodes = tuple(corner_ids[c] for c in tet)
-                    tet_below = tuple(below[c] for c in tet)
-                    nb = sum(tet_below)
-                    if nb == 0 or nb == 4:
-                        continue
-                    crossings: List[Tuple[int, int]] = []
-                    for ea, eb in _TET_EDGES:
-                        if tet_below[ea] != tet_below[eb]:
-                            crossings.append(
-                                canonical_edge_key(tet_nodes[ea], tet_nodes[eb])
+                for tet_index, crossings, triangles, degenerates in _cell_primitives(
+                    values, iso_f, ni, nj, i, j, k
+                ):
+                    vids_for = {key: get_vertex(key) for key in crossings}
+                    for tri in triangles:
+                        vids = (vids_for[tri[0]], vids_for[tri[1]], vids_for[tri[2]])
+                        p0, p1, p2 = (vertices[v].point for v in vids)
+                        faces.append(
+                            Face(id=len(faces), vertex_ids=vids, area=_tri_area(p0, p1, p2))
+                        )
+                        for a, b in ((0, 1), (1, 2), (2, 0)):
+                            ekey = (
+                                (vids[a], vids[b])
+                                if vids[a] < vids[b]
+                                else (vids[b], vids[a])
                             )
-                    # K4 二染色下穿越边数只可能是 3 或 4。
-                    if len(crossings) == 3:
-                        vids = tuple(get_vertex(key) for key in crossings)
-                        pts = [vertices[v].point for v in vids]
-                        ref_local = 0 if not tet_below[0] else next(
-                            idx for idx in range(1, 4) if not tet_below[idx]
-                        )
-                        ref_point = ncoord(tet_nodes[ref_local])
-                        order = _oriented_loop(pts, [0, 1, 2], ref_point)
-                        emit_triangle(
-                            (vids[order[0]], vids[order[1]], vids[order[2]]),
-                            cell,
-                            tet_index,
-                        )
-                    else:  # 4 条穿越边：一个四边形，切成两个三角形
-                        entries = [(get_vertex(key), key) for key in crossings]
-                        pts = [vertices[v].point for v, _ in entries]
-                        centroid = (
-                            sum(p[0] for p in pts) / 4.0,
-                            sum(p[1] for p in pts) / 4.0,
-                            sum(p[2] for p in pts) / 4.0,
-                        )
-                        above_local = [idx for idx in range(4) if not tet_below[idx]]
-                        below_local = [idx for idx in range(4) if tet_below[idx]]
-                        above_mid = tuple(
-                            sum(ncoord(tet_nodes[idx])[d] for idx in above_local)
-                            / len(above_local)
-                            for d in range(3)
-                        )
-                        below_mid = tuple(
-                            sum(ncoord(tet_nodes[idx])[d] for idx in below_local)
-                            / len(below_local)
-                            for d in range(3)
-                        )
-                        ref = _sub(above_mid, below_mid)
-                        if _norm(ref) == 0.0:
-                            ref = (1.0, 0.0, 0.0)
-                        # 构造与 ref 垂直的平面基 (u, w)。
-                        axis = min(
-                            range(3),
-                            key=lambda d: (abs(ref[d]), d),
-                        )
-                        basis = [0.0, 0.0, 0.0]
-                        basis[axis] = 1.0
-                        u = _cross(ref, tuple(basis))
-                        u = tuple(c / _norm(u) for c in u)
-                        w = _cross(ref, u)
-
-                        def angle(idx: int) -> float:
-                            rel = _sub(pts[idx], centroid)
-                            return math.atan2(_dot(rel, w), _dot(rel, u))
-
-                        order = sorted(
-                            range(4), key=lambda idx: (angle(idx), entries[idx][1])
-                        )
-                        ref_point = above_mid
-                        loop = _oriented_loop(pts, list(order), ref_point)
-                        emit_triangle(
-                            (entries[loop[0]][0], entries[loop[1]][0], entries[loop[2]][0]),
-                            cell,
-                            tet_index,
-                        )
-                        emit_triangle(
-                            (entries[loop[0]][0], entries[loop[2]][0], entries[loop[3]][0]),
-                            cell,
-                            tet_index,
+                            edge_use[ekey] = edge_use.get(ekey, 0) + 1
+                    for tri in degenerates:
+                        degenerate.append(
+                            DegenerateFace(cell=cell, tet_index=tet_index, edge_keys=tri)
                         )
 
     boundary_edges = tuple(sorted(key for key, c in edge_use.items() if c == 1))
@@ -538,3 +571,280 @@ def extract_isosurface(field: ScalarField3D, iso: float) -> IsosurfaceMesh:
         nonmanifold_edges=nonmanifold_edges,
         edge_use_count=dict(edge_use),
     )
+
+
+# ---------------------------------------------------------------------------
+# 增量更新
+# ---------------------------------------------------------------------------
+
+class IsosurfaceExtractor:
+    """有状态增量提取器：体数据局部修改后只重算受影响的单元。
+
+    用法::
+
+        ext = IsosurfaceExtractor(field, iso)
+        mesh0 = ext.mesh()
+        mesh1 = ext.update({node_index: new_value, ...})
+
+    契约
+    ----
+    - 受影响单元 = 任意被修改节点邻接的立方体（每方向 -1..0，裁剪到网格内），
+      只有这些单元的四面体图元被重新计算；其余单元的面与顶点原样保留。
+    - 顶点身份：顶点挂在全局网格边键上。未受影响边上的顶点 id、坐标不变；
+      端点值变化但仍穿越的边保留原顶点 id（坐标原地刷新）；新出现的穿越边
+      分配从未使用过的新 id；消失的边其顶点 id 退役且永不复用。面 id 同理。
+      因此上层持有的未受影响顶点/面 id 在更新后仍然有效。
+    - 共享边一致性：交点按全局边键唯一存储，修改区域边缘的共享边交点只
+      更新一次，所有引用它的面（无论属于哪个单元）自动看到同一坐标，
+      不会产生裂缝。
+    - 原子性：update 先完成全部校验与新图元计算，再一次性提交内部状态；
+      校验或计算失败时抛出异常，旧状态完全不变，旧网格可继续使用。
+    - 几何一致性：更新后的几何（顶点坐标集合与三角形集合）与对修改后的
+      场调用 extract_isosurface 全量重提取逐位一致；仅顶点/面 id 与
+      排列顺序可能不同。
+
+    注意：mesh() 返回的 IsosurfaceMesh 中，Vertex.id / Face.id 是稳定身份，
+    不一定是 vertices / faces 元组中的下标；请按 .id 建立索引，不要直接用
+    id 当下标（全量 extract_isosurface 的结果仍保证 id == 下标）。
+    """
+
+    def __init__(self, field: ScalarField3D, iso: float) -> None:
+        if not isinstance(field, ScalarField3D):
+            raise InvalidInputError(
+                "field", f"must be a ScalarField3D, got {type(field).__name__}"
+            )
+        self._iso = _finite_float("iso", iso)
+        self._ni, self._nj, self._nk = field.ni, field.nj, field.nk
+        self._values: List[float] = list(field.values)
+        self._vertices: Dict[int, Vertex] = {}
+        self._vertex_by_edge: Dict[Tuple[int, int], int] = {}
+        self._vertex_ref: Dict[int, int] = {}
+        self._faces: Dict[int, Face] = {}
+        self._edge_use: Dict[Tuple[int, int], int] = {}
+        self._cell_vertices: Dict[Tuple[int, int, int], Tuple[int, ...]] = {}
+        self._cell_faces: Dict[Tuple[int, int, int], Tuple[int, ...]] = {}
+        self._cell_degenerate: Dict[Tuple[int, int, int], Tuple[DegenerateFace, ...]] = {}
+        self._next_vid = 0
+        self._next_fid = 0
+        for k in range(self._nk - 1):
+            for j in range(self._nj - 1):
+                for i in range(self._ni - 1):
+                    prims = _cell_primitives(
+                        self._values, self._iso, self._ni, self._nj, i, j, k
+                    )
+                    if prims:
+                        self._add_cell((i, j, k), prims)
+
+    @property
+    def iso(self) -> float:
+        """当前等值。"""
+        return self._iso
+
+    @property
+    def dims(self) -> Tuple[int, int, int]:
+        """网格维度 (ni, nj, nk)。"""
+        return (self._ni, self._nj, self._nk)
+
+    # -- 内部状态操作 -------------------------------------------------
+
+    def _get_vertex(self, key: Tuple[int, int]) -> int:
+        point, t = _interpolate_edge(self._values, self._iso, self._ni, self._nj, key)
+        vid = self._vertex_by_edge.get(key)
+        if vid is None:
+            vid = self._next_vid
+            self._next_vid += 1
+            self._vertex_by_edge[key] = vid
+            self._vertex_ref[vid] = 0
+        # 坐标按当前值原地刷新：端点未变时结果逐位相同，端点变化时所有
+        # 引用该顶点的面都属于受影响单元、随即被重建，因此始终一致。
+        self._vertices[vid] = Vertex(id=vid, point=point, edge_key=key, t=t)
+        return vid
+
+    def _add_cell(self, cell, prims) -> None:
+        fids: List[int] = []
+        degens: List[DegenerateFace] = []
+        cell_vids = set()
+        for tet_index, crossings, triangles, degenerates in prims:
+            vids_for = {key: self._get_vertex(key) for key in crossings}
+            cell_vids.update(vids_for.values())
+            for tri in triangles:
+                vids = (vids_for[tri[0]], vids_for[tri[1]], vids_for[tri[2]])
+                p0, p1, p2 = (self._vertices[v].point for v in vids)
+                fid = self._next_fid
+                self._next_fid += 1
+                self._faces[fid] = Face(
+                    id=fid, vertex_ids=vids, area=_tri_area(p0, p1, p2)
+                )
+                fids.append(fid)
+                for a, b in ((0, 1), (1, 2), (2, 0)):
+                    ekey = (
+                        (vids[a], vids[b]) if vids[a] < vids[b] else (vids[b], vids[a])
+                    )
+                    self._edge_use[ekey] = self._edge_use.get(ekey, 0) + 1
+            for tri in degenerates:
+                degens.append(
+                    DegenerateFace(cell=cell, tet_index=tet_index, edge_keys=tri)
+                )
+        # 顶点引用计数按“包含该穿越边的单元”计（与全量提取的顶点存在性
+        # 语义一致：只要任一单元把它列为穿越边，顶点就存在）。
+        for vid in cell_vids:
+            self._vertex_ref[vid] += 1
+        self._cell_vertices[cell] = tuple(sorted(cell_vids))
+        if fids:
+            self._cell_faces[cell] = tuple(fids)
+        if degens:
+            self._cell_degenerate[cell] = tuple(degens)
+
+    def _remove_cell(self, cell, keep_vids=frozenset()) -> None:
+        for fid in self._cell_faces.pop(cell, ()):
+            face = self._faces.pop(fid)
+            vids = face.vertex_ids
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                ekey = (vids[a], vids[b]) if vids[a] < vids[b] else (vids[b], vids[a])
+                count = self._edge_use[ekey] - 1
+                if count == 0:
+                    del self._edge_use[ekey]
+                else:
+                    self._edge_use[ekey] = count
+        for vid in self._cell_vertices.pop(cell, ()):
+            ref = self._vertex_ref[vid] - 1
+            if ref == 0 and vid not in keep_vids:
+                vertex = self._vertices.pop(vid)
+                del self._vertex_by_edge[vertex.edge_key]
+                del self._vertex_ref[vid]
+            else:
+                self._vertex_ref[vid] = ref
+        self._cell_degenerate.pop(cell, None)
+
+    # -- 公开接口 -----------------------------------------------------
+
+    def update(self, changes) -> IsosurfaceMesh:
+        """应用局部体数据修改并返回更新后的网格。
+
+        参数
+        ----
+        changes : Mapping[int, float] 或 (index, value) 对的可迭代对象
+            节点扁平索引 -> 新标量值。索引必须在 [0, ni*nj*nk) 内且不得
+            重复；值必须为有限实数。空修改为合法无操作。
+
+        抛出
+        ----
+        InvalidInputError
+            任何修改项非法时；此时内部状态完全不变，旧网格仍可使用。
+        """
+        parsed = self._parse_changes(changes)
+        if not parsed:
+            return self.mesh()
+        ni, nj, nk = self._ni, self._nj, self._nk
+        new_values = list(self._values)
+        for idx, value in parsed.items():
+            new_values[idx] = value
+        affected = set()
+        for idx in parsed:
+            i = idx % ni
+            j = (idx // ni) % nj
+            k = idx // (ni * nj)
+            for dk in (-1, 0):
+                for dj in (-1, 0):
+                    for di in (-1, 0):
+                        ci, cj, ck = i + di, j + dj, k + dk
+                        if 0 <= ci < ni - 1 and 0 <= cj < nj - 1 and 0 <= ck < nk - 1:
+                            affected.add((ci, cj, ck))
+        # 纯计算阶段：任何异常都在提交前抛出，内部状态不变。
+        new_prims = {
+            cell: _cell_primitives(new_values, self._iso, ni, nj, cell[0], cell[1], cell[2])
+            for cell in sorted(affected)
+        }
+        # 更新后仍然穿越的边保留其顶点 id（身份尽量保留）。
+        keep_vids = set()
+        for prims in new_prims.values():
+            for _, crossings, _, _ in prims:
+                for key in crossings:
+                    vid = self._vertex_by_edge.get(key)
+                    if vid is not None:
+                        keep_vids.add(vid)
+        # 提交阶段：仅字典增删，不会失败。
+        self._values = new_values
+        for cell in sorted(affected):
+            self._remove_cell(cell, keep_vids)
+        for cell in sorted(affected):
+            if new_prims[cell]:
+                self._add_cell(cell, new_prims[cell])
+        return self.mesh()
+
+    def _parse_changes(self, changes) -> Dict[int, float]:
+        if isinstance(changes, Mapping):
+            items = list(changes.items())
+        elif isinstance(changes, (str, bytes)):
+            raise InvalidInputError(
+                "changes",
+                "must be a mapping or an iterable of (index, value) pairs, "
+                f"got {type(changes).__name__}",
+            )
+        else:
+            try:
+                items = [tuple(pair) for pair in changes]
+            except TypeError:
+                raise InvalidInputError(
+                    "changes",
+                    "must be a mapping or an iterable of (index, value) pairs, "
+                    f"got {type(changes).__name__}",
+                ) from None
+        node_count = self._ni * self._nj * self._nk
+        parsed: Dict[int, float] = {}
+        for item in items:
+            if len(item) != 2:
+                raise InvalidInputError(
+                    "changes", f"each change must be an (index, value) pair, got {item!r}"
+                )
+            idx, value = item
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                raise InvalidInputError(
+                    "changes", f"node index must be an int, got {type(idx).__name__}"
+                )
+            if not 0 <= idx < node_count:
+                raise InvalidInputError(
+                    "changes", f"node index {idx} out of range [0, {node_count})"
+                )
+            if idx in parsed:
+                raise InvalidInputError("changes", f"duplicate node index {idx}")
+            parsed[idx] = _finite_float(f"changes[{idx}]", value)
+        return parsed
+
+    def mesh(self) -> IsosurfaceMesh:
+        """当前状态的网格快照（O(网格规模)）。"""
+        ni, nj, nk = self._ni, self._nj, self._nk
+        vertices = tuple(self._vertices[vid] for vid in sorted(self._vertices))
+        faces = tuple(self._faces[fid] for fid in sorted(self._faces))
+        degenerate: List[DegenerateFace] = []
+        for cell in sorted(self._cell_degenerate, key=lambda c: (c[2], c[1], c[0])):
+            degenerate.extend(self._cell_degenerate[cell])
+        boundary_edges = tuple(
+            sorted(key for key, c in self._edge_use.items() if c == 1)
+        )
+        nonmanifold_edges = tuple(
+            sorted(key for key, c in self._edge_use.items() if c >= 3)
+        )
+        cell_count = (ni - 1) * (nj - 1) * (nk - 1)
+        stats = MeshStats(
+            iso=self._iso,
+            node_count=ni * nj * nk,
+            cell_count=cell_count,
+            tetrahedron_count=cell_count * len(TETRA_TABLE),
+            vertex_count=len(vertices),
+            face_count=len(faces),
+            degenerate_face_count=len(degenerate),
+            boundary_edge_count=len(boundary_edges),
+            nonmanifold_edge_count=len(nonmanifold_edges),
+            total_area=sum(f.area for f in faces),
+        )
+        return IsosurfaceMesh(
+            iso=self._iso,
+            vertices=vertices,
+            faces=faces,
+            stats=stats,
+            degenerate_faces=tuple(degenerate),
+            boundary_edges=boundary_edges,
+            nonmanifold_edges=nonmanifold_edges,
+            edge_use_count=dict(self._edge_use),
+        )

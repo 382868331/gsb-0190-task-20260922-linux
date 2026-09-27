@@ -43,6 +43,7 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   - `ScalarField3D.from_nested(nested)`：由 `nested[k][j][i]` 嵌套序列构造。
 - `extract_isosurface(field, iso) -> IsosurfaceMesh`：提取等值面。
   `iso` 为有限实数。
+- `IsosurfaceExtractor(field, iso)`：有状态增量提取器（见“增量更新”）。
 
 ### 输出（`IsosurfaceMesh`，冻结数据类）
 
@@ -59,6 +60,39 @@ print(mesh.stats.total_area, mesh.stats.nonmanifold_edge_count)
   序号、三条边键）。
 - `boundary_edges` / `nonmanifold_edges` / `edge_use_count`：边级明细。
 - 合法但处处不穿越 `iso` 的场返回**空网格**（已证明无等值面），不抛异常。
+
+## 增量更新
+
+体数据只改了一小片时，用 `IsosurfaceExtractor` 避免全量重算：
+
+```python
+from iso3d import IsosurfaceExtractor
+
+ext = IsosurfaceExtractor(field, iso=16.0)
+mesh0 = ext.mesh()
+mesh1 = ext.update({node_index: new_value, ...})  # 只重算受影响单元
+```
+
+- `update(changes)`：`changes` 为 `{扁平节点索引: 新值}` 映射或
+  `(index, value)` 对序列；返回更新后的 `IsosurfaceMesh`。
+  受影响单元 = 被修改节点邻接的立方体，只有这些单元的四面体图元被
+  重新计算。
+- **身份保留**：顶点挂在全局网格边键上。未受影响的顶点/面 id 不变；
+  端点值变化但仍穿越的边保留原顶点 id（坐标原地刷新）；新穿越边分配
+  从未使用过的新 id；消失的 id 退役且永不复用。上层持有的未受影响
+  顶点/面 id 在更新后仍然有效。
+- **共享边一致**：修改区域边缘的共享边交点按全局边键唯一存储、只更新
+  一次，所有引用它的面自动看到同一坐标，不会产生裂缝；值跨越 iso 时
+  新增/消失的三角形由受影响单元的重建自然处理。
+- **几何一致**：更新后的几何（顶点坐标集合与三角形集合）与对修改后的
+  场调用 `extract_isosurface` 全量重提取逐位一致，仅 id 与顺序可能
+  不同（`tests/test_incremental.py` 逐位验证）。
+- **失败原子性**：`update` 先完成全部校验与新图元计算，再一次提交；
+  校验或计算失败时抛出 `InvalidInputError`，内部状态完全不变，旧网格
+  可继续使用。
+- 注意：增量更新后的网格中 `Vertex.id` / `Face.id` 是稳定身份，不一定
+  等于 `vertices` / `faces` 元组下标，请按 `.id` 建立索引（全量
+  `extract_isosurface` 的结果仍保证 id == 下标）。
 
 ### 公开常量与辅助
 
@@ -112,6 +146,8 @@ TETRA_TABLE = (
 - `values`：拒绝非序列、长度不符、NaN、±Infinity、bool、非数值；
 - `iso`：拒绝 bool、非数值、NaN、±Infinity；
 - `field`：拒绝非 `ScalarField3D` 对象。
+- `changes`（增量更新）：拒绝非映射/非键值对序列、bool 或非 int 索引、
+  越界索引、重复索引、bool/非数值/NaN/±Infinity 的值。
 
 输入校验在任何计算之前完成，失败时不产生任何部分结果；本模块为纯函数
 式接口，无可变全局状态。空结果（无穿越）是合法的“已证明无等值面”，
@@ -163,7 +199,8 @@ tests/
   test_tetra_table.py  # 分解表几何性质
   test_extraction.py   # 平面解析、共享边、iso 落顶点、常量场、球场闭合性
   test_validation.py   # 输入校验与错误语义
-demo.py                # 固定输入演示（正常结果 + 拒绝边界）
+  test_incremental.py  # 增量更新：几何一致性、身份保留、失败原子性
+demo.py                # 固定输入演示（正常结果 + 增量更新 + 拒绝边界）
 README.md
 ```
 

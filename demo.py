@@ -3,13 +3,19 @@
 运行：python demo.py
 内容：
   1. 正常结果：16^3 球谐场（解析球）等值面提取，输出面积与非流形边计数等统计；
-  2. 拒绝边界：标量场含 NaN，演示可定位的 InvalidInputError。
+  2. 增量更新：局部修改体数据后只重算受影响单元，几何与全量重提取一致；
+  3. 拒绝边界：标量场含 NaN，演示可定位的 InvalidInputError。
 """
 
 import math
 import time
 
-from iso3d import InvalidInputError, ScalarField3D, extract_isosurface
+from iso3d import (
+    InvalidInputError,
+    IsosurfaceExtractor,
+    ScalarField3D,
+    extract_isosurface,
+)
 
 
 def sphere_field(n=16, radius=4.0):
@@ -66,9 +72,59 @@ def demo_rejection():
     print()
 
 
+def demo_incremental():
+    print("=== 增量更新：修改 2x2x2 节点，只重算受影响单元 ===")
+    field, iso, _ = sphere_field()
+    n = field.ni
+    ext = IsosurfaceExtractor(field, iso)
+    base = ext.mesh()
+    print(f"更新前           : {base.stats.vertex_count} 顶点 / "
+          f"{base.stats.face_count} 三角形")
+    # 在中心附近挖一个 2x2x2 的凹坑（局部修改）。
+    changes = {}
+    for dk in (0, 1):
+        for dj in (0, 1):
+            for di in (0, 1):
+                idx = ((8 + dk) * n + (8 + dj)) * n + (8 + di)
+                changes[idx] = field.values[idx] - 5.0
+    t0 = time.perf_counter()
+    updated = ext.update(changes)
+    elapsed = time.perf_counter() - t0
+    print(f"更新后           : {updated.stats.vertex_count} 顶点 / "
+          f"{updated.stats.face_count} 三角形 (增量耗时 {elapsed * 1000.0:.1f} ms)")
+    # 与全量重提取逐位比较几何（顶点坐标集合 + 三角形集合）。
+    new_values = list(field.values)
+    for idx, value in changes.items():
+        new_values[idx] = value
+    full = extract_isosurface(
+        ScalarField3D(ni=n, nj=n, nk=n, values=tuple(new_values)), iso
+    )
+    def signature(mesh):
+        pts = {v.id: v.point for v in mesh.vertices}
+        return (
+            set(pts.values()),
+            {tuple(sorted(pts[v] for v in f.vertex_ids)) for f in mesh.faces},
+        )
+    same = signature(updated) == signature(full)
+    # 未受影响顶点身份保留：比较更新前后共同顶点 id 的数量。
+    kept = len({v.id for v in base.vertices} & {v.id for v in updated.vertices})
+    print(f"几何与全量重提取一致: {'是' if same else '否'}")
+    print(f"保留的旧顶点 id 数  : {kept} / {base.stats.vertex_count}")
+    print(f"边界/非流形边       : {updated.stats.boundary_edge_count} / "
+          f"{updated.stats.nonmanifold_edge_count} (闭合球面应均为 0)")
+    # 更新失败时旧结果仍可使用。
+    try:
+        ext.update({0: math.nan})
+    except InvalidInputError as exc:
+        print(f"非法更新已拒绝     : {exc}；旧网格仍可用: "
+              f"{'是' if ext.mesh().stats.face_count == updated.stats.face_count else '否'}")
+    print()
+
+
 def main():
     t0 = time.perf_counter()
     demo_sphere()
+    demo_incremental()
     demo_rejection()
     print(f"demo 总耗时: {time.perf_counter() - t0:.2f} s")
 
